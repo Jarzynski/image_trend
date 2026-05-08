@@ -1,6 +1,10 @@
 # Image Trend
 
-基于 A 股日频 OHLCV 数据生成二值蜡烛图，并使用传统特征与 2D CNN 预测未来股票收益方向。项目流程参考 Jiang, Kelly and Xiu (2023) 的价格图像建模思路，并扩展为矩阵收益研究：
+基于 A 股日频 OHLCV 数据生成二值蜡烛图，并使用传统特征与 2D CNN 预测未来股票收益方向。项目流程参考 Jiang, Kelly and Xiu (2023) 的价格图像建模思路，并扩展为矩阵收益研究。
+
+当前版本：`v1.0`
+
+## 项目内容
 
 | 实验 | 图像窗口 | 预测收益窗口 | 图像形状 |
 | --- | ---: | ---: | --- |
@@ -10,7 +14,13 @@
 | I20R20 | 20 个交易日 | 20 个交易日 | `[N, 64, 60, 1]` |
 | I60R20 | 60 个交易日 | 20 个交易日 | `[N, 96, 180, 1]` |
 
-GitHub 仓库只保存 Python 源码、`README.md`、`05_train_cnn2d.md` 和 `.gitignore`。原始数据、生成特征、图像矩阵、模型权重、预测结果和论文 PDF 不上传。
+V1.0 的收益与回测口径改为更接近实盘的执行假设：信号在日期 `t` 收盘后形成，次一交易日 `t+1` 按可交易开盘价买入，并在持有期结束日收盘卖出。
+
+```text
+future_ret_h = close_adj[t + h] / open_adj[t + 1] - 1
+```
+
+GitHub 仓库保存 Python 源码、`README.md`、`05_train_cnn2d.md` 和 `.gitignore`。原始数据、生成特征、图像矩阵、模型权重、预测结果和论文 PDF 不上传。
 
 ## 文件夹结构
 
@@ -22,6 +32,7 @@ image_trend/
 ├── 03_make_images.py
 ├── 04_train_logistic.py
 ├── 05_train_cnn2d.py
+├── 05_train_cnn2d.md
 ├── 06_backtest_decile.py
 ├── README.md
 ├── data/                    # 本地生成，不上传
@@ -33,7 +44,6 @@ image_trend/
 │   ├── models/
 │   └── tables/
 ├── presentation_work/        # 本地材料，不上传
-├── 05_train_cnn2d.md         # CNN 训练脚本详细说明文档，上传
 └── Jiang 等 - 2023 - (Re‐)Imag(in)ing Price Trends.pdf  # 本地论文，不上传
 ```
 
@@ -45,17 +55,32 @@ N:\quant\A_share\daily_OHLVC\
 └── 后复权\
 ```
 
-## 脚本输入输出
+## 输入输出
 
 | 文件 | 作用 | 输入 | 输出 | 数据格式 |
 | --- | --- | --- | --- | --- |
-| `config.py` | 统一配置路径、样本区间、训练切分、实验矩阵和回测参数 | 无直接输入 | 自动创建 `data/`、`outputs/` 及其子目录 | Python 配置对象 |
+| `config.py` | 统一配置路径、样本区间、训练切分、实验矩阵、手续费网格和 universe split 参数 | 无直接输入 | 自动创建 `data/`、`outputs/` 及其子目录 | Python 配置对象 |
 | `01_build_panel.py` | 合并每只股票的不复权和后复权日频行情，生成标准股票-日期面板 | `../daily_OHLVC/不复权/*.csv`；`../daily_OHLVC/后复权/*.csv` | `data/processed/panel_daily.parquet` | 输入为逐股票 CSV；输出为 Parquet，包含 raw/adjusted OHLCV、成交额、市值、行业、ST、涨停等字段 |
-| `02_make_labels_and_baselines.py` | 生成未来收益标签和传统量价基线特征 | `data/processed/panel_daily.parquet` | `data/features/baseline_features.parquet` | Parquet；包含 `future_ret_{h}d`、`label_{h}d`、收益率、反转、动量、均线偏离、价格位置、波动率、流动性和 `is_tradable` |
+| `02_make_labels_and_baselines.py` | 生成未来收益标签、传统量价基线特征和可执行回测收益字段 | `data/processed/panel_daily.parquet` | `data/features/baseline_features.parquet` | Parquet；包含 `future_ret_{h}d`、`label_{h}d`、`ret_1d`、`open_to_close_ret_1d`、动量/反转/波动率/流动性/市值特征和 `is_tradable` |
 | `03_make_images.py` | 按 `EXPERIMENTS` 生成 Jiang 风格二值价格图像 | `data/features/baseline_features.parquet` | `data/images/images_{experiment}.npy`；`data/images/meta_{experiment}.parquet` | `.npy` 为 `uint8` 图像矩阵 `[N,H,W,1]`，像素值 `0/255`；metadata 为 Parquet，每行对应一张图 |
 | `04_train_logistic.py` | 对每个实验训练传统特征 Logistic 基线 | `data/features/baseline_features.parquet` | `outputs/predictions/pred_{experiment}_logistic.parquet` | Parquet；包含测试集 `date`、`code`、`future_ret`、`label`、`experiment_name`、`window`、`horizon`、`model_name`、`pred_prob` |
 | `05_train_cnn2d.py` | 对每个实验训练 Jiang/Kelly/Xiu 风格 2D CNN | `data/images/images_{experiment}.npy`；`data/images/meta_{experiment}.parquet` | `outputs/models/jiang_cnn2d_{experiment}.pt`；`outputs/predictions/pred_{experiment}_jiang_cnn2d.parquet` | `.pt` 为 PyTorch `state_dict`；预测 Parquet 字段与 Logistic 输出对齐 |
-| `06_backtest_decile.py` | 对所有预测文件做横截面十分组回测 | `outputs/predictions/pred_*.parquet` | `outputs/tables/decile_returns.csv`；`outputs/tables/long_short_returns.csv`；`outputs/tables/performance_summary.csv` | CSV；分别保存分组收益、多空收益和绩效指标 |
+| `06_backtest_decile.py` | 评估预测效果、Decile 单调性和 D1-D10 long-only 重叠持仓组合 | `outputs/predictions/pred_*.parquet`；`data/features/baseline_features.parquet` | `outputs/tables/*.csv` | CSV；包含 IC、RankIC、累计 IC、Decile 未来收益、单调性、组合收益、换手、手续费敏感度和绩效汇总 |
+
+`06_backtest_decile.py` 输出表：
+
+```text
+outputs/tables/ic_by_period.csv
+outputs/tables/ic_summary.csv
+outputs/tables/cumulative_ic.csv
+outputs/tables/decile_returns.csv
+outputs/tables/decile_summary.csv
+outputs/tables/decile_monotonicity.csv
+outputs/tables/portfolio_returns.csv
+outputs/tables/portfolio_turnover.csv
+outputs/tables/performance_summary.csv
+outputs/tables/cost_sensitivity.csv
+```
 
 ## 推荐运行顺序
 
@@ -68,15 +93,16 @@ uv run python 05_train_cnn2d.py
 uv run python 06_backtest_decile.py
 ```
 
+如果从 v0.1.x 升级到 v1.0，需要从 `02_make_labels_and_baselines.py` 开始重新生成下游数据，因为未来收益标签和组合回测收益字段已经改变。
+
 若依赖缺失，请统一安装后再运行。当前项目约定不在脚本中自动安装依赖。
 
 ## 版本记录
-
-当前版本：`v0.1.1`
 
 后续每次推送前应更新本表，并创建同名 Git tag。
 
 | 日期 | 版本 | 推送内容 | 新增功能 | 待更新功能 |
 | --- | --- | --- | --- | --- |
-| 2026-05-08 | `v0.1.1` | 上传 CNN 训练脚本详细说明文档 | 将 `05_train_cnn2d.md` 纳入 Git 版本管理，便于同步查看 05 脚本的逐函数、全流程和变量解释 | 优先：按持有期修正回测年化因子；增加RankIC，ICIR等测评；后续：实现重叠持仓组合，主要是不以Rn的n为持仓周期，而以滚动持仓为周期；增加训练日志与参数配置文件；补充单元测试和数据 schema 检查|
-| 2026-05-08 | `v0.1.0` | 首次源码入库 | 建立 A 股日频面板、标签与基线特征、I5/I20/I60 图像生成、矩阵收益实验、Logistic 基线、Jiang 风格 2D CNN、十分组回测 | 按持有期修正回测年化因子；实现重叠持仓组合；增加训练日志与参数配置文件；补充单元测试和数据 schema 检查；加入混合精度和多卡训练支持 |
+| 2026-05-09 | `v1.0` | 重大版本：收益标签、回测评估和组合绩效体系升级 | 未来收益改为次日开盘买入、持有期末收盘卖出；新增 `open_to_close_ret_1d`；新增 IC/RankIC、ICIR、累计 IC、各期 IC；新增 D1-D10 decile 平均未来收益和单调性监测；新增 D1-D10 long-only 重叠持仓组合；新增 turnover、gross/net return、手续费敏感度曲线；新增 large-cap vs small/mid-cap universe split；移除多空组合收益输出；新增预测和日收益字段检查 | 完善训练日志与独立参数配置文件；补充正式单元测试和全链路 schema 检查；加入混合精度和多卡训练支持；加入更严格交易约束，如涨停无法买入、停牌处理和滑点模型 |
+| 2026-05-08 | `v0.1.1` | 上传 CNN 训练脚本详细说明文档 | 将 `05_train_cnn2d.md` 纳入 Git 版本管理，便于同步查看 05 脚本的逐函数、全流程和变量解释 | ~~按持有期修正回测年化因子~~；~~增加 RankIC、ICIR 等测评~~；~~实现重叠持仓组合~~；增加训练日志与独立参数配置文件；补充正式单元测试和全链路 schema 检查；加入混合精度和多卡训练支持 |
+| 2026-05-08 | `v0.1.0` | 首次源码入库 | 建立 A 股日频面板、标签与基线特征、I5/I20/I60 图像生成、矩阵收益实验、Logistic 基线、Jiang 风格 2D CNN、十分组回测 | ~~按持有期修正回测年化因子~~；~~实现重叠持仓组合~~；增加训练日志与独立参数配置文件；补充正式单元测试和全链路 schema 检查；加入混合精度和多卡训练支持 |

@@ -18,6 +18,7 @@ Key outputs
 -----------
 future_ret_{h}d and label_{h}d for horizons configured in EXPERIMENTS
 ret_1d, ret_5d, ret_20d, etc.
+open_to_close_ret_1d for executable next-open entry portfolio returns
 ma gap features
 price-position features
 volatility features
@@ -77,6 +78,14 @@ def add_returns_and_labels(df):
     Important:
     All shift operations must be grouped by code to avoid leakage
     across different stocks.
+
+    Future-return convention:
+    A signal formed at date t buys at the next trading day's adjusted open
+    and exits at the horizon date's adjusted close:
+
+        future_ret_h = close_adj[t + h] / open_adj[t + 1] - 1
+
+    Therefore h=5 holds trading days t+1 through t+5.
     """
     g = df.groupby("code", group_keys=False)
 
@@ -85,11 +94,19 @@ def add_returns_and_labels(df):
     for n in return_windows:
         df[f"ret_{n}d"] = g["close_adj"].pct_change(n)
 
+    df["open_to_close_ret_1d"] = safe_divide(
+        df["close_adj"],
+        df["open_adj"].where(df["open_adj"] > 0),
+    ) - 1.0
+
     # Future returns used by configured prediction horizons.
     for h in configured_horizons():
-        future_close = g["close_adj"].shift(-h)
-        df[f"future_ret_{h}d"] = future_close / df["close_adj"] - 1.0
-        df[f"label_{h}d"] = (df[f"future_ret_{h}d"] > 0).astype(int)
+        buy_open = g["open_adj"].shift(-1).where(lambda x: x > 0)
+        sell_close = g["close_adj"].shift(-h).where(lambda x: x > 0)
+        future_ret = safe_divide(sell_close, buy_open) - 1.0
+
+        df[f"future_ret_{h}d"] = future_ret
+        df[f"label_{h}d"] = np.where(future_ret.notna(), (future_ret > 0).astype(int), np.nan)
 
     return df
 

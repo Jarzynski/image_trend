@@ -8,6 +8,7 @@
 # Track only project source and repository metadata.
 !*.py
 !README.md
+!05_train_cnn2d.md
 !.gitignore
 
 # Keep generated and local-only directories out of Git.
@@ -34,3 +35,4 @@ __pycache__/
 *.zip
 *.md
 !README.md
+!05_train_cnn2d.md

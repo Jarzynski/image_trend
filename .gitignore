@@ -1,0 +1,36 @@
+# Ignore everything by default so local data and model artifacts cannot be
+# uploaded accidentally.
+*
+
+# Allow directories to be traversed for future source files.
+!*/
+
+# Track only project source and repository metadata.
+!*.py
+!README.md
+!.gitignore
+
+# Keep generated and local-only directories out of Git.
+data/
+outputs/
+presentation_work/
+__pycache__/
+
+# Generated/cache artifacts.
+*.py[cod]
+*.npy
+*.npz
+*.parquet
+*.csv
+*.pt
+*.pth
+*.log
+
+# Local references and large documents.
+*.pdf
+*.xlsx
+*.xls
+*.docx
+*.zip
+*.md
+!README.md

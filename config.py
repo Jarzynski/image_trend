@@ -50,12 +50,23 @@ PANEL_BY_CODE_DIR = PROCESSED_DIR / "panel_by_code"
 PANEL_BY_YEAR_DIR = PROCESSED_DIR / "panel_by_year"
 BASELINE_FEATURE_PATH = FEATURE_DIR / "baseline_features.parquet"
 
-def image_path_for_experiment(exp_name):
-    return IMAGE_DIR / f"images_{exp_name.lower()}.npy"
+IMAGE_SHARD_SIZE = 10_000
 
 
-def meta_path_for_experiment(exp_name):
-    return IMAGE_DIR / f"meta_{exp_name.lower()}.parquet"
+def image_dir_for_experiment(exp_name):
+    return IMAGE_DIR / exp_name.lower()
+
+
+def shard_dir_for_experiment(exp_name, shard_id):
+    return image_dir_for_experiment(exp_name) / f"shard_{shard_id:05d}"
+
+
+def shard_image_path(exp_name, shard_id):
+    return shard_dir_for_experiment(exp_name, shard_id) / "images.npy"
+
+
+def shard_meta_path(exp_name, shard_id):
+    return shard_dir_for_experiment(exp_name, shard_id) / "meta.parquet"
 
 
 # ============================================================

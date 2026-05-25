@@ -8,8 +8,8 @@ Train Jiang, Kelly, and Xiu-style 2D CNNs on binary price images.
 
 Inputs
 ------
-data/images/images_{experiment_name}.npy
-data/images/meta_{experiment_name}.parquet
+data/images/{experiment_name}/shard_*/images.npy
+data/images/{experiment_name}/shard_*/meta.parquet
 
 Outputs
 -------
@@ -42,8 +42,7 @@ from config import (
     RANDOM_SEED,
     CNN_WEIGHT_DECAY,
     EXPERIMENTS,
-    image_path_for_experiment,
-    meta_path_for_experiment,
+    image_dir_for_experiment,
 )
 
 
@@ -55,13 +54,17 @@ class ImageDataset(Dataset):
     """
     Simple torch Dataset for price images.
 
-    images: numpy array or memmap [N, H, W, C]
+    image_shards: list of numpy arrays or memmaps [N, H, W, C]
     labels: numpy array [N]
+    shard_ids: numpy array [N]
+    local_indices: numpy array [N]
     indices: row indices for this split
     """
-    def __init__(self, images, labels, indices):
-        self.images = images
+    def __init__(self, image_shards, labels, shard_ids, local_indices, indices):
+        self.image_shards = image_shards
         self.labels = labels.astype(np.float32)
+        self.shard_ids = np.asarray(shard_ids, dtype=np.int64)
+        self.local_indices = np.asarray(local_indices, dtype=np.int64)
         self.indices = np.asarray(indices, dtype=np.int64)
 
     def __len__(self):
@@ -69,7 +72,9 @@ class ImageDataset(Dataset):
 
     def __getitem__(self, idx):
         real_idx = self.indices[idx]
-        x = self.images[real_idx].astype(np.float32)
+        shard_id = self.shard_ids[real_idx]
+        local_idx = self.local_indices[real_idx]
+        x = self.image_shards[shard_id][local_idx].astype(np.float32)
 
         # Convert NHWC to CHW for PyTorch.
         x = np.ascontiguousarray(np.transpose(x, (2, 0, 1)))
@@ -278,21 +283,60 @@ def evaluate_model(model, loader, device, criterion):
     return probs, labels, auc, acc, brier, avg_loss
 
 
-def train_one_experiment(exp_name, cfg, image_path, meta_path, n_epochs=50, batch_size=128, lr=1e-5):
+def load_image_shards(exp_name):
+    """
+    Load all image shards and metadata shards for one experiment.
+    """
+    image_dir = image_dir_for_experiment(exp_name)
+    shard_dirs = sorted(image_dir.glob("shard_*"))
+    if not shard_dirs:
+        raise RuntimeError(f"No image shards found for {exp_name}: {image_dir}")
+
+    image_shards = []
+    meta_frames = []
+
+    for expected_shard_id, shard_dir in enumerate(shard_dirs):
+        image_path = shard_dir / "images.npy"
+        meta_path = shard_dir / "meta.parquet"
+        if not image_path.exists() or not meta_path.exists():
+            raise RuntimeError(f"Incomplete image shard: {shard_dir}")
+
+        images = np.load(image_path, mmap_mode="r")
+        meta = pd.read_parquet(meta_path)
+
+        if "shard_id" not in meta.columns:
+            meta["shard_id"] = expected_shard_id
+        if "local_index" not in meta.columns:
+            meta["local_index"] = np.arange(len(meta), dtype=np.int64)
+
+        if len(meta) != images.shape[0]:
+            raise RuntimeError(
+                f"Shard row mismatch in {shard_dir}: "
+                f"images={images.shape[0]}, meta={len(meta)}"
+            )
+
+        meta["shard_id"] = expected_shard_id
+        image_shards.append(images)
+        meta_frames.append(meta)
+
+    meta = pd.concat(meta_frames, ignore_index=True)
+    meta["date"] = pd.to_datetime(meta["date"])
+    return image_shards, meta
+
+
+def train_one_experiment(exp_name, cfg, n_epochs=50, batch_size=128, lr=1e-5):
     """
     Train CNN for one experiment.
     """
     set_random_seed(RANDOM_SEED)
 
-    print(f"Loading images: {image_path}")
-    images = np.load(image_path, mmap_mode="r")
-    image_height, image_width = images.shape[1], images.shape[2]
-
-    print(f"Loading metadata: {meta_path}")
-    meta = pd.read_parquet(meta_path)
-    meta["date"] = pd.to_datetime(meta["date"])
+    print(f"Loading image shards: {image_dir_for_experiment(exp_name)}")
+    image_shards, meta = load_image_shards(exp_name)
+    image_height, image_width = image_shards[0].shape[1], image_shards[0].shape[2]
 
     labels = meta["label"].values.astype(np.float32)
+    shard_ids = meta["shard_id"].values.astype(np.int64)
+    local_indices = meta["local_index"].values.astype(np.int64)
 
     train_mask, valid_mask, test_mask = get_split_masks(meta, cfg["horizon"])
 
@@ -314,7 +358,7 @@ def train_one_experiment(exp_name, cfg, image_path, meta_path, n_epochs=50, batc
     train_generator.manual_seed(RANDOM_SEED)
 
     train_loader = DataLoader(
-        ImageDataset(images, labels, train_idx),
+        ImageDataset(image_shards, labels, shard_ids, local_indices, train_idx),
         batch_size=batch_size,
         shuffle=True,
         num_workers=0,
@@ -323,7 +367,7 @@ def train_one_experiment(exp_name, cfg, image_path, meta_path, n_epochs=50, batc
     )
 
     valid_loader = DataLoader(
-        ImageDataset(images, labels, valid_idx),
+        ImageDataset(image_shards, labels, shard_ids, local_indices, valid_idx),
         batch_size=batch_size,
         shuffle=False,
         num_workers=0,
@@ -331,7 +375,7 @@ def train_one_experiment(exp_name, cfg, image_path, meta_path, n_epochs=50, batc
     )
 
     test_loader = DataLoader(
-        ImageDataset(images, labels, test_idx),
+        ImageDataset(image_shards, labels, shard_ids, local_indices, test_idx),
         batch_size=batch_size,
         shuffle=False,
         num_workers=0,
@@ -449,8 +493,6 @@ def main():
         train_one_experiment(
             exp_name,
             cfg,
-            image_path_for_experiment(exp_name),
-            meta_path_for_experiment(exp_name),
         )
 
 

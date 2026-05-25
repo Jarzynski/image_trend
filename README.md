@@ -2,7 +2,7 @@
 
 基于 A 股日频 OHLCV 数据生成二值蜡烛图，并使用传统特征与 2D CNN 预测未来股票收益方向。项目流程参考 Jiang, Kelly and Xiu (2023) 的价格图像建模思路，并扩展为矩阵收益研究。
 
-当前版本：`v1.2`
+当前版本：`v1.2.1`
 
 ## 项目内容
 
@@ -62,9 +62,9 @@ N:\quant\A_share\daily_OHLVC\
 | `config.py` | 统一配置路径、样本区间、训练切分、实验矩阵、手续费网格和 universe split 参数 | 无直接输入 | 自动创建 `data/`、`outputs/` 及其子目录 | Python 配置对象 |
 | `01_build_panel.py` | 合并每只股票的不复权和后复权日频行情，生成标准股票-日期面板 dataset | `../daily_OHLVC/不复权/*.csv`；`../daily_OHLVC/后复权/*.csv` | `data/processed/panel_by_code/code=*/part.parquet`；`data/processed/panel_by_year/year=*/part-*.parquet` | 输入为逐股票 CSV；输出为按 `code` 和按 `year` 分区的 Parquet dataset，包含 raw/adjusted OHLCV、成交额、市值、行业、ST、涨停等字段 |
 | `02_make_labels_and_baselines.py` | 生成未来收益标签、传统量价基线特征和可执行回测收益字段 | `data/processed/panel_by_code/code=*/part.parquet` | `data/features/baseline_features.parquet` | Parquet；包含 `future_ret_{h}d`、`label_{h}d`、`ret_1d`、`open_to_close_ret_1d`、动量/反转/波动率/流动性/市值特征、`is_tradable` 和低量涨跌停交易约束字段 |
-| `03_make_images.py` | 按 `EXPERIMENTS` 生成 Jiang 风格二值价格图像 | `data/features/baseline_features.parquet` | `data/images/images_{experiment}.npy`；`data/images/meta_{experiment}.parquet` | `.npy` 为 `uint8` 图像矩阵 `[N,H,W,1]`，像素值 `0/255`；metadata 为 Parquet，每行对应一张图 |
+| `03_make_images.py` | 按 `EXPERIMENTS` 生成 Jiang 风格二值价格图像 shard | `data/features/baseline_features.parquet` | `data/images/{experiment}/shard_*/images.npy`；`data/images/{experiment}/shard_*/meta.parquet` | 每个 shard 的 `.npy` 为 `uint8` 图像矩阵 `[N,H,W,1]`，像素值 `0/255`；metadata 为 Parquet，每行对应同 shard 中一张图 |
 | `04_train_logistic.py` | 对每个实验训练传统特征 Logistic 基线 | `data/features/baseline_features.parquet` | `outputs/predictions/pred_{experiment}_logistic.parquet` | Parquet；包含测试集 `date`、`code`、`future_ret`、`label`、`experiment_name`、`window`、`horizon`、`model_name`、`pred_prob` |
-| `05_train_cnn2d.py` | 对每个实验训练 Jiang/Kelly/Xiu 风格 2D CNN | `data/images/images_{experiment}.npy`；`data/images/meta_{experiment}.parquet` | `outputs/models/jiang_cnn2d_{experiment}.pt`；`outputs/predictions/pred_{experiment}_jiang_cnn2d.parquet` | `.pt` 为 PyTorch `state_dict`；预测 Parquet 字段与 Logistic 输出对齐 |
+| `05_train_cnn2d.py` | 对每个实验训练 Jiang/Kelly/Xiu 风格 2D CNN | `data/images/{experiment}/shard_*/images.npy`；`data/images/{experiment}/shard_*/meta.parquet` | `outputs/models/jiang_cnn2d_{experiment}.pt`；`outputs/predictions/pred_{experiment}_jiang_cnn2d.parquet` | `.pt` 为 PyTorch `state_dict`；预测 Parquet 字段与 Logistic 输出对齐 |
 | `06_backtest_decile.py` | 评估预测效果、Decile 单调性和 D1-D10 long-only 重叠持仓组合 | `outputs/predictions/pred_*.parquet`；`data/features/baseline_features.parquet` | `outputs/tables/*.csv` | CSV；包含 IC、RankIC、累计 IC、Decile 未来收益、单调性、组合收益、换手、手续费敏感度和绩效汇总 |
 
 `06_backtest_decile.py` 输出表：
@@ -107,6 +107,7 @@ uv run python 06_backtest_decile.py
 
 | 日期 | 版本 | 推送内容 | 新增功能 | 待更新功能 |
 | --- | --- | --- | --- | --- |
+| 2026-05-25 | `v1.2.1` | 图像特征 shard 化 | `03_make_images.py` 改为每个实验输出 `shard_*/images.npy` 和 `shard_*/meta.parquet`；新增 `IMAGE_SHARD_SIZE`；`05_train_cnn2d.py` 改为跨 shard 读取 memmap，并用 `shard_id/local_index` 定位样本；降低单个图像文件过大和训练时一次性依赖单文件的风险 | 继续优化 `baseline_features.parquet` 的分片读取；增加结构化 experiment log；补充分年度、行业暴露和 beta 暴露报表 |
 | 2026-05-25 | `v1.2` | 面板构建性能和 Parquet 数据格式升级 | `01_build_panel.py` 改为输出 `panel_by_code` 和 `panel_by_year` 双 Parquet dataset；默认启用 12 进程按股票读取、清洗和合并；保留 `--workers 1` 单进程路径；新增 `--limit-codes` 小样本测试入口；CSV 默认 `gbk` 并保留 fallback；数值转换加速；面板 schema 下压为 `float32/float64/int8`；`02_make_labels_and_baselines.py` 改为从 `panel_by_code` 读取；文档同步新数据格式 | 将图像生成进一步 shard 化；增加结构化 experiment log；补充分年度、行业暴露和 beta 暴露报表；进一步处理北交所 30% 涨跌停和更细滑点模型 |
 | 2026-05-25 | `v1.1` | 防过拟合与可交易性修正 | 增加按 horizon 的 purge/embargo 切分；增加随机种子和 CNN weight decay；新增按日期+代码板块的涨跌停阈值与低量涨跌停标记；回测中低量涨停不可买、低量跌停/停牌/缺收益延迟卖出；缺失收益不再填 0；新增 blocked buy/sell、forced hold、data missing 诊断字段；增加未来收益复利一致性检查 | 增加结构化 experiment log；补充分年度、行业暴露和 beta 暴露报表；进一步处理北交所 30% 涨跌停和更细滑点模型 |
 | 2026-05-09 | `v1.0` | 重大版本：收益标签、回测评估和组合绩效体系升级 | 未来收益改为次日开盘买入、持有期末收盘卖出；新增 `open_to_close_ret_1d`；新增 IC/RankIC、ICIR、累计 IC、各期 IC；新增 D1-D10 decile 平均未来收益和单调性监测；新增 D1-D10 long-only 重叠持仓组合；新增 turnover、gross/net return、手续费敏感度曲线；新增 large-cap vs small/mid-cap universe split；移除多空组合收益输出；新增预测和日收益字段检查 | 完善训练日志与独立参数配置文件；补充正式单元测试和全链路 schema 检查；加入混合精度和多卡训练支持；加入更严格交易约束，如涨停无法买入、停牌处理和滑点模型 |

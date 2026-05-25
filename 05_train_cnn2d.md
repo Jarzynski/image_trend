@@ -41,8 +41,8 @@ N:\quant\A_share\image_trend\05_train_cnn2d.py
     -> data/features/baseline_features.parquet
 
 03_make_images.py
-    -> data/images/images_{experiment}.npy
-    -> data/images/meta_{experiment}.parquet
+    -> data/images/{experiment}/shard_*/images.npy
+    -> data/images/{experiment}/shard_*/meta.parquet
 
 05_train_cnn2d.py
     -> outputs/models/jiang_cnn2d_{experiment}.pt
@@ -58,20 +58,20 @@ N:\quant\A_share\image_trend\05_train_cnn2d.py
 
 ### 3.1 图像数组
 
-路径由 `config.image_path_for_experiment(exp_name)` 生成：
+路径由 `config.image_dir_for_experiment(exp_name)` 生成：
 
 ```text
-data/images/images_{experiment_name.lower()}.npy
+data/images/{experiment_name.lower()}/shard_*/images.npy
 ```
 
 示例：
 
 ```text
-data/images/images_i5r5.npy
-data/images/images_i20r5.npy
-data/images/images_i60r5.npy
-data/images/images_i20r20.npy
-data/images/images_i60r20.npy
+data/images/i5r5/shard_00000/images.npy
+data/images/i20r5/shard_00000/images.npy
+data/images/i60r5/shard_00000/images.npy
+data/images/i20r20/shard_00000/images.npy
+data/images/i60r20/shard_00000/images.npy
 ```
 
 格式：
@@ -95,30 +95,30 @@ data/images/images_i60r20.npy
 | `W` | 图像宽度，等于 `window * 3` |
 | `C` | 通道数，当前为 1，即黑白单通道 |
 
-脚本使用：
+每个 shard 内部仍是标准 `.npy` 数组，训练脚本逐个 shard 以内存映射方式打开：
 
 ```python
-images = np.load(image_path, mmap_mode="r")
+images = np.load(shard_image_path, mmap_mode="r")
 ```
 
-这里使用 `mmap_mode="r"`，表示以内存映射方式只读加载图像文件。好处是不会一次性把完整 `.npy` 全部加载进内存，尤其对 I60 图像很重要。
+这里使用 `mmap_mode="r"`，表示以内存映射方式只读加载图像文件。好处是不会一次性把单个 shard 的完整 `.npy` 全部复制进内存；同时 shard 化避免把全部样本集中在一个超大 `.npy` 文件中，尤其对 I60 图像更重要。
 
 ### 3.2 图像 metadata
 
-路径由 `config.meta_path_for_experiment(exp_name)` 生成：
+路径由 `config.image_dir_for_experiment(exp_name)` 生成：
 
 ```text
-data/images/meta_{experiment_name.lower()}.parquet
+data/images/{experiment_name.lower()}/shard_*/meta.parquet
 ```
 
 示例：
 
 ```text
-data/images/meta_i5r5.parquet
-data/images/meta_i20r5.parquet
-data/images/meta_i60r5.parquet
-data/images/meta_i20r20.parquet
-data/images/meta_i60r20.parquet
+data/images/i5r5/shard_00000/meta.parquet
+data/images/i20r5/shard_00000/meta.parquet
+data/images/i60r5/shard_00000/meta.parquet
+data/images/i20r20/shard_00000/meta.parquet
+data/images/i60r20/shard_00000/meta.parquet
 ```
 
 格式：
@@ -294,8 +294,7 @@ from config import (...)
 | `VALID_END` | 验证集结束日期 |
 | `TEST_START` | 测试集开始日期 |
 | `EXPERIMENTS` | 实验矩阵配置 |
-| `image_path_for_experiment` | 根据实验名生成 `.npy` 路径 |
-| `meta_path_for_experiment` | 根据实验名生成 metadata 路径 |
+| `image_dir_for_experiment` | 根据实验名生成 shard 根目录 |
 
 ## 7. 全流程概览
 
@@ -309,11 +308,11 @@ if __name__ == "__main__":
 `main()` 执行以下流程：
 
 1. 遍历 `config.EXPERIMENTS` 中的所有实验。
-2. 对每个实验生成图像路径和 metadata 路径。
+2. 对每个实验定位 shard 根目录。
 3. 调用 `train_one_experiment(...)`。
 4. 在 `train_one_experiment(...)` 内部：
-   - 读取图像；
-   - 读取 metadata；
+   - 读取全部图像 shard；
+   - 合并全部 metadata shard；
    - 按日期切分 train/valid/test；
    - 构建 Dataset 和 DataLoader；
    - 初始化 JiangCNN2D；
@@ -328,11 +327,7 @@ if __name__ == "__main__":
 
 ```text
 for exp_name, cfg in EXPERIMENTS:
-    image_path = image_path_for_experiment(exp_name)
-    meta_path = meta_path_for_experiment(exp_name)
-
-    images = np.load(image_path, mmap_mode="r")
-    meta = pd.read_parquet(meta_path)
+    image_shards, meta = load_image_shards(exp_name)
 
     train_mask, valid_mask, test_mask = get_split_masks(meta)
 
@@ -373,7 +368,7 @@ class ImageDataset(Dataset):
 
 - 图像文件可能很大，尤其是 I60；
 - 脚本使用 `np.load(..., mmap_mode="r")`，不希望提前复制 train/valid/test 三份数组；
-- Dataset 只保存全量 memmap 和当前 split 的 indices；
+- Dataset 只保存 shard memmap 列表、样本定位索引和当前 split 的 indices；
 - 每次 `__getitem__` 只读取一个样本。
 
 ### `ImageDataset.__init__`
@@ -381,30 +376,39 @@ class ImageDataset(Dataset):
 定义：
 
 ```python
-def __init__(self, images, labels, indices):
+def __init__(self, image_shards, labels, shard_ids, local_indices, indices):
 ```
 
 输入变量：
 
 | 变量 | 类型 | 含义 |
 |---|---|---|
-| `images` | NumPy array 或 memmap | 全量图像数组，形状 `[N, H, W, C]` |
+| `image_shards` | list[memmap] | 图像 shard 列表，每个 shard 形状 `[N, H, W, C]` |
 | `labels` | NumPy array | 全量标签数组，形状 `[N]` |
+| `shard_ids` | NumPy array | 全量样本对应的 shard 编号 |
+| `local_indices` | NumPy array | 全量样本在各自 shard 内的行号 |
 | `indices` | array-like | 当前 split 使用的行号 |
 
 内部变量：
 
 ```python
-self.images = images
+self.image_shards = image_shards
 ```
 
-保存图像数组引用。这里不复制图像。
+保存图像 shard 引用。这里不复制图像。
 
 ```python
 self.labels = labels.astype(np.float32)
 ```
 
 把标签转成 `float32`，因为 `BCEWithLogitsLoss` 需要浮点标签。
+
+```python
+self.shard_ids = np.asarray(shard_ids, dtype=np.int64)
+self.local_indices = np.asarray(local_indices, dtype=np.int64)
+```
+
+保存每个全量样本的 shard 定位信息。
 
 ```python
 self.indices = np.asarray(indices, dtype=np.int64)
@@ -449,13 +453,15 @@ def __getitem__(self, idx):
 real_idx = self.indices[idx]
 ```
 
-把 split 内部索引转换成全量图像数组中的真实行号。
+把 split 内部索引转换成全量 metadata 中的真实行号。
 
 ```python
-x = self.images[real_idx].astype(np.float32)
+shard_id = self.shard_ids[real_idx]
+local_idx = self.local_indices[real_idx]
+x = self.image_shards[shard_id][local_idx].astype(np.float32)
 ```
 
-读取单张图像，并转为 `float32`。
+定位到具体 shard，读取单张图像，并转为 `float32`。
 
 注意：当前图像像素是 `0/255`。这里没有除以 255，因此模型看到的是 `0` 或 `255`。这贴近论文中 “0 or 255 for black or white pixels” 的表述。
 
@@ -1146,7 +1152,7 @@ return probs, labels, auc, acc, brier, avg_loss
 定义：
 
 ```python
-def train_one_experiment(exp_name, cfg, image_path, meta_path, n_epochs=50, batch_size=128, lr=1e-5):
+def train_one_experiment(exp_name, cfg, n_epochs=50, batch_size=128, lr=1e-5):
 ```
 
 用途：
@@ -1161,49 +1167,35 @@ def train_one_experiment(exp_name, cfg, image_path, meta_path, n_epochs=50, batc
 |---|---:|---|
 | `exp_name` | 无 | 实验名，例如 `I20R5` |
 | `cfg` | 无 | 当前实验在 `EXPERIMENTS` 中的配置 |
-| `image_path` | 无 | 当前实验图像 `.npy` 路径 |
-| `meta_path` | 无 | 当前实验 metadata parquet 路径 |
 | `n_epochs` | `50` | 最大训练 epoch 数 |
 | `batch_size` | `128` | mini-batch 样本数 |
 | `lr` | `1e-5` | Adam 初始学习率 |
 
-### 8.7.1 加载图像
+### 8.7.1 加载图像 shard 和 metadata
 
 ```python
-print(f"Loading images: {image_path}")
-images = np.load(image_path, mmap_mode="r")
-image_height, image_width = images.shape[1], images.shape[2]
+print(f"Loading image shards: {image_dir_for_experiment(exp_name)}")
+image_shards, meta = load_image_shards(exp_name)
+image_height, image_width = image_shards[0].shape[1], image_shards[0].shape[2]
 ```
 
 变量解释：
 
 | 变量 | 含义 |
 |---|---|
-| `images` | 内存映射方式读取的图像数组 |
+| `image_shards` | 多个 shard 的图像 memmap 列表 |
+| `meta` | 合并后的 metadata 表 |
 | `image_height` | 图像高度 |
 | `image_width` | 图像宽度 |
 
-这里不复制图像数据，适合大样本。
+这里不复制图像数据，适合大样本。每个样本通过 `shard_id` 和 `local_index` 定位到具体 shard 内的位置。
 
-### 8.7.2 加载 metadata
-
-```python
-print(f"Loading metadata: {meta_path}")
-meta = pd.read_parquet(meta_path)
-meta["date"] = pd.to_datetime(meta["date"])
-```
-
-变量解释：
-
-| 变量 | 含义 |
-|---|---|
-| `meta` | 当前实验 metadata 表 |
-| `meta["date"]` | 转成 datetime 后用于时间切分 |
-
-### 8.7.3 提取标签
+### 8.7.2 提取标签与 shard 索引
 
 ```python
 labels = meta["label"].values.astype(np.float32)
+shard_ids = meta["shard_id"].values.astype(np.int64)
+local_indices = meta["local_index"].values.astype(np.int64)
 ```
 
 `labels` 是长度为 `N` 的 NumPy 数组。
@@ -1277,7 +1269,7 @@ pin_memory = device.type == "cuda"
 
 ```python
 train_loader = DataLoader(
-    ImageDataset(images, labels, train_idx),
+    ImageDataset(image_shards, labels, shard_ids, local_indices, train_idx),
     batch_size=batch_size,
     shuffle=True,
     num_workers=0,
@@ -1289,7 +1281,7 @@ train_loader = DataLoader(
 
 ```python
 valid_loader = DataLoader(
-    ImageDataset(images, labels, valid_idx),
+    ImageDataset(image_shards, labels, shard_ids, local_indices, valid_idx),
     batch_size=batch_size,
     shuffle=False,
     num_workers=0,
@@ -1301,7 +1293,7 @@ valid_loader = DataLoader(
 
 ```python
 test_loader = DataLoader(
-    ImageDataset(images, labels, test_idx),
+    ImageDataset(image_shards, labels, shard_ids, local_indices, test_idx),
     batch_size=batch_size,
     shuffle=False,
     num_workers=0,
@@ -1610,12 +1602,7 @@ pred.to_parquet(out_path, index=False)
 ```python
 def main():
     for exp_name, cfg in EXPERIMENTS.items():
-        train_one_experiment(
-            exp_name,
-            cfg,
-            image_path_for_experiment(exp_name),
-            meta_path_for_experiment(exp_name),
-        )
+        train_one_experiment(exp_name, cfg)
 ```
 
 用途：
@@ -1628,8 +1615,7 @@ def main():
 |---|---|
 | `exp_name` | 实验名，例如 `I60R20` |
 | `cfg` | 当前实验配置 |
-| `image_path_for_experiment(exp_name)` | 当前实验 `.npy` 图像路径 |
-| `meta_path_for_experiment(exp_name)` | 当前实验 metadata parquet 路径 |
+| `image_dir_for_experiment(exp_name)` | 当前实验 shard 根目录 |
 
 当前执行顺序由 `config.EXPERIMENTS` 的字典顺序决定。
 
@@ -1639,9 +1625,9 @@ def main():
 
 | 变量 | 位置 | 含义 |
 |---|---|---|
-| `image_path` | `train_one_experiment` 参数 | 图像 `.npy` 文件路径 |
-| `meta_path` | `train_one_experiment` 参数 | metadata parquet 文件路径 |
-| `images` | `train_one_experiment` | 图像数组 memmap |
+| `image_shards` | `train_one_experiment` | 多个 shard 图像数组 memmap 列表 |
+| `shard_ids` | `train_one_experiment` | 每行样本所在 shard 的编号 |
+| `local_indices` | `train_one_experiment` | 每行样本在 shard 内的行号 |
 | `image_height` | `train_one_experiment` | 图像高度 |
 | `image_width` | `train_one_experiment` | 图像宽度 |
 | `meta` | `train_one_experiment` | metadata DataFrame |
@@ -1818,7 +1804,7 @@ uv run python 05_train_cnn2d.py
 前提：
 
 1. 已运行 `03_make_images.py`；
-2. `data/images/` 下已有所有实验的 `.npy` 和 `meta_*.parquet`；
+2. `data/images/{experiment}/shard_*/` 下已有所有实验的 `images.npy` 和 `meta.parquet`；
 3. Python 环境中已有 `numpy/pandas/pyarrow/torch/scikit-learn`；
 4. GPU 环境可用时，PyTorch 能正确识别 CUDA。
 
@@ -1830,7 +1816,7 @@ uv run python 05_train_cnn2d.py
 
 - 未运行 `03_make_images.py`；
 - 实验配置改过，但旧图像没有重新生成；
-- 文件名与 `image_path_for_experiment(exp_name)` 不一致。
+- 文件名与 `image_dir_for_experiment(exp_name)` 不一致。
 
 处理：
 
@@ -1854,7 +1840,7 @@ if len(train_idx) == 0 or len(valid_idx) == 0 or len(test_idx) == 0:
 处理：
 
 - 检查 `config.py` 中的 `TRAIN_END/VALID_START/VALID_END/TEST_START`；
-- 检查对应 `meta_*.parquet` 的日期范围。
+- 检查对应 `shard_*/meta.parquet` 的日期范围。
 
 ## 13.3 AUC 显示为 `nan`
 
@@ -1916,12 +1902,7 @@ torch.cuda.is_available()
 def main():
     exp_name = "I20R5"
     cfg = EXPERIMENTS[exp_name]
-    train_one_experiment(
-        exp_name,
-        cfg,
-        image_path_for_experiment(exp_name),
-        meta_path_for_experiment(exp_name),
-    )
+    train_one_experiment(exp_name, cfg)
 ```
 
 ### 14.2 想调整 batch size
@@ -1990,8 +1971,8 @@ torch.save(
 
 - `config.py` 中 `EXPERIMENTS` 正确；
 - `03_make_images.py` 已按当前配置重新生成图像；
-- `data/images/images_i5r5.npy` 存在；
-- `data/images/meta_i5r5.parquet` 存在；
+- `data/images/i5r5/shard_00000/images.npy` 存在；
+- `data/images/i5r5/shard_00000/meta.parquet` 存在；
 - 其他实验对应文件也存在；
 - `.npy` 的样本数与 metadata 行数一致；
 - `meta["date"]` 覆盖 train/valid/test 三个区间；

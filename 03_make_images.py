@@ -11,8 +11,8 @@ data/features/baseline_features.parquet
 Outputs
 -------
 For each EXPERIMENTS entry in config.py:
-data/images/images_{experiment_name}.npy
-data/images/meta_{experiment_name}.parquet
+data/images/{experiment_name}/shard_00000/images.npy
+data/images/{experiment_name}/shard_00000/meta.parquet
 
 Image design
 ------------
@@ -28,20 +28,19 @@ Image design
 
 import numpy as np
 import pandas as pd
-import pyarrow as pa
 import pyarrow.parquet as pq
+import shutil
 
 from config import (
     BASELINE_FEATURE_PATH,
     DAY_WIDTH,
     WHITE_PIXEL,
     EXPERIMENTS,
-    image_path_for_experiment,
-    meta_path_for_experiment,
+    IMAGE_SHARD_SIZE,
+    image_dir_for_experiment,
+    shard_image_path,
+    shard_meta_path,
 )
-
-
-META_CHUNK_SIZE = 50_000
 
 
 def scale_price_to_y(price, p_min, p_max, price_height):
@@ -256,72 +255,62 @@ def iter_valid_samples(df, exp_name, cfg, with_image):
                 yield None, meta
 
 
-def count_samples(df, exp_name, cfg):
-    return sum(1 for _img, _meta in iter_valid_samples(df, exp_name, cfg, with_image=False))
+def clear_experiment_image_dir(exp_name):
+    image_dir = image_dir_for_experiment(exp_name)
+    if image_dir.exists():
+        shutil.rmtree(image_dir)
+    image_dir.mkdir(parents=True, exist_ok=True)
 
 
-def write_meta_chunk(meta_rows, writer, meta_path):
-    table = pa.Table.from_pandas(pd.DataFrame(meta_rows), preserve_index=False)
-    if writer is None:
-        writer = pq.ParquetWriter(meta_path, table.schema, compression="zstd")
-    writer.write_table(table)
-    return writer
+def write_image_shard(exp_name, shard_id, image_rows, meta_rows):
+    if not image_rows:
+        return 0
+
+    shard_dir = shard_image_path(exp_name, shard_id).parent
+    shard_dir.mkdir(parents=True, exist_ok=True)
+
+    images = np.stack(image_rows, axis=0).astype(np.uint8, copy=False)
+    np.save(shard_image_path(exp_name, shard_id), images)
+
+    meta = pd.DataFrame(meta_rows)
+    meta["shard_id"] = shard_id
+    meta["local_index"] = np.arange(len(meta), dtype=np.int64)
+    meta.to_parquet(shard_meta_path(exp_name, shard_id), index=False)
+
+    return len(meta)
 
 
 def generate_images_for_experiment(df, exp_name, cfg):
     """
-    Generate one experiment's image .npy and metadata parquet.
+    Generate one experiment's image shards and metadata shards.
     """
-    image_height = cfg["image_height"]
-    width = cfg["image_width"]
+    clear_experiment_image_dir(exp_name)
 
-    image_path = image_path_for_experiment(exp_name)
-    meta_path = meta_path_for_experiment(exp_name)
-
-    print(f"Counting samples for {exp_name}...")
-    n_samples = count_samples(df, exp_name, cfg)
-    if n_samples == 0:
-        raise RuntimeError(f"No images generated for {exp_name}. Check filters and columns.")
-
-    print(f"{exp_name} sample count: {n_samples}")
-    print(f"Writing images to: {image_path}")
-    images = np.lib.format.open_memmap(
-        image_path,
-        mode="w+",
-        dtype=np.uint8,
-        shape=(n_samples, image_height, width, 1),
-    )
-
-    writer = None
+    image_rows = []
     meta_rows = []
+    shard_id = 0
     written = 0
 
-    try:
-        for img, meta in iter_valid_samples(df, exp_name, cfg, with_image=True):
-            if written >= n_samples:
-                raise RuntimeError(f"{exp_name} generated more samples than counted.")
+    print(f"Writing sharded images to: {image_dir_for_experiment(exp_name)}")
+    for img, meta in iter_valid_samples(df, exp_name, cfg, with_image=True):
+        image_rows.append(img)
+        meta_rows.append(meta)
 
-            images[written] = img
-            written += 1
-            meta_rows.append(meta)
+        if len(image_rows) >= IMAGE_SHARD_SIZE:
+            written += write_image_shard(exp_name, shard_id, image_rows, meta_rows)
+            print(f"{exp_name} wrote shard {shard_id:05d}: {len(image_rows)} samples")
+            shard_id += 1
+            image_rows = []
+            meta_rows = []
 
-            if len(meta_rows) >= META_CHUNK_SIZE:
-                writer = write_meta_chunk(meta_rows, writer, meta_path)
-                meta_rows = []
+    if image_rows:
+        written += write_image_shard(exp_name, shard_id, image_rows, meta_rows)
+        print(f"{exp_name} wrote shard {shard_id:05d}: {len(image_rows)} samples")
 
-        if meta_rows:
-            writer = write_meta_chunk(meta_rows, writer, meta_path)
-    finally:
-        images.flush()
-        if writer is not None:
-            writer.close()
+    if written == 0:
+        raise RuntimeError(f"No images generated for {exp_name}. Check filters and columns.")
 
-    if written != n_samples:
-        raise RuntimeError(f"{exp_name} count mismatch: counted {n_samples}, wrote {written}.")
-
-    print(f"Saved metadata to: {meta_path}")
-    print(exp_name, "images shape:", images.shape)
-    print(exp_name, "meta rows:", written)
+    print(exp_name, "total image rows:", written)
 
 
 def main():

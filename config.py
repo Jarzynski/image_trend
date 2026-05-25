@@ -46,7 +46,8 @@ for p in [
 # 2. Standard output files
 # ============================================================
 
-PANEL_PATH = PROCESSED_DIR / "panel_daily.parquet"
+PANEL_BY_CODE_DIR = PROCESSED_DIR / "panel_by_code"
+PANEL_BY_YEAR_DIR = PROCESSED_DIR / "panel_by_year"
 BASELINE_FEATURE_PATH = FEATURE_DIR / "baseline_features.parquet"
 
 def image_path_for_experiment(exp_name):
@@ -77,6 +78,10 @@ EMBARGO_DAYS_BY_HORIZON = {
 
 RANDOM_SEED = 42
 CNN_WEIGHT_DECAY = 1e-4
+
+N_WORKERS = 12
+PANEL_MAX_BUFFER_ROWS = 500_000
+PANEL_ROW_GROUP_SIZE = 128_000
 
 # Main liquidity threshold.
 # You can later test 10m, 50m, 100m as robustness checks.

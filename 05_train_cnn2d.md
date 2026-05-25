@@ -34,7 +34,8 @@ N:\quant\A_share\image_trend\05_train_cnn2d.py
 
 ```text
 01_build_panel.py
-    -> data/processed/panel_daily.parquet
+    -> data/processed/panel_by_code/code=*/part.parquet
+    -> data/processed/panel_by_year/year=*/part-*.parquet
 
 02_make_labels_and_baselines.py
     -> data/features/baseline_features.parquet

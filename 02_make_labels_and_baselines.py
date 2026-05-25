@@ -8,7 +8,7 @@ Generate future-return labels and traditional baseline features.
 
 Input
 -----
-data/processed/panel_daily.parquet
+data/processed/panel_by_code/code=*/part.parquet
 
 Output
 ------
@@ -28,9 +28,10 @@ tradable flag
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from config import (
-    PANEL_PATH,
+    PANEL_BY_CODE_DIR,
     BASELINE_FEATURE_PATH,
     MIN_AMOUNT,
     MIN_LIST_DAYS,
@@ -46,6 +47,29 @@ def safe_divide(a, b):
     out = a / b
     out = out.replace([np.inf, -np.inf], np.nan)
     return out
+
+
+def load_panel_by_code():
+    """
+    Load the code-partitioned panel dataset produced by 01_build_panel.py.
+    """
+    files = sorted(PANEL_BY_CODE_DIR.glob("code=*/part.parquet"))
+    if not files:
+        raise RuntimeError(
+            f"No code-partitioned panel files found in {PANEL_BY_CODE_DIR}. "
+            "Run 01_build_panel.py first."
+        )
+
+    frames = []
+    for path in files:
+        one = pq.ParquetFile(path).read().to_pandas()
+        one["code"] = path.parent.name.split("=", 1)[1]
+        frames.append(one)
+
+    df = pd.concat(frames, ignore_index=True)
+    df["date"] = pd.to_datetime(df["date"])
+    df["code"] = df["code"].astype(str).str.zfill(6)
+    return df.sort_values(["code", "date"]).reset_index(drop=True)
 
 
 def configured_horizons():
@@ -261,9 +285,8 @@ def add_final_tradable_flag(df):
 
 
 def main():
-    print(f"Reading panel: {PANEL_PATH}")
-    df = pd.read_parquet(PANEL_PATH)
-    df = df.sort_values(["code", "date"]).reset_index(drop=True)
+    print(f"Reading code-partitioned panel: {PANEL_BY_CODE_DIR}")
+    df = load_panel_by_code()
 
     print("Adding returns and labels...")
     df = add_returns_and_labels(df)

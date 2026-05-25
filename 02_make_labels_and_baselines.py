@@ -35,6 +35,7 @@ from config import (
     MIN_AMOUNT,
     MIN_LIST_DAYS,
     EXPERIMENTS,
+    LOW_VOLUME_LIMIT_RATIO,
 )
 
 
@@ -69,6 +70,29 @@ def configured_ma_windows():
                 pass
 
     return sorted(windows)
+
+
+def calc_limit_pct(df):
+    """
+    Board-aware daily limit threshold in percentage points.
+
+    pct_chg is expected to use percentage units, e.g. 9.8 means 9.8%.
+    """
+    code = df["code"].astype(str).str.zfill(6)
+    date = pd.to_datetime(df["date"])
+
+    limit_pct = pd.Series(9.8, index=df.index, dtype="float64")
+
+    limit_pct.loc[code.str.startswith("688")] = 19.8
+
+    is_chinext = code.str.startswith(("300", "301"))
+    chinext_reform = date >= pd.Timestamp("2020-08-24")
+    limit_pct.loc[is_chinext & chinext_reform] = 19.8
+
+    if "is_st" in df.columns:
+        limit_pct.loc[pd.to_numeric(df["is_st"], errors="coerce").fillna(0) == 1] = 4.8
+
+    return limit_pct
 
 
 def add_returns_and_labels(df):
@@ -107,6 +131,46 @@ def add_returns_and_labels(df):
 
         df[f"future_ret_{h}d"] = future_ret
         df[f"label_{h}d"] = np.where(future_ret.notna(), (future_ret > 0).astype(int), np.nan)
+
+    return df
+
+
+def add_trading_constraint_features(df):
+    """
+    Add board-aware low-volume limit-up/down execution flags.
+
+    The rolling volume baseline excludes the current day so the low-volume
+    check uses only information available before that trading session.
+    """
+    g = df.groupby("code", group_keys=False)
+
+    df["limit_pct"] = calc_limit_pct(df)
+    df["volume_mean_20d_prev"] = g["volume"].transform(
+        lambda x: x.shift(1).rolling(20, min_periods=20).mean()
+    )
+    df["volume_ratio_to_20d_prev"] = safe_divide(
+        df["volume"],
+        df["volume_mean_20d_prev"].where(df["volume_mean_20d_prev"] > 0),
+    )
+
+    pct_chg = pd.to_numeric(df["pct_chg"], errors="coerce")
+    volume = pd.to_numeric(df["volume"], errors="coerce")
+    low_volume = (
+        df["volume_mean_20d_prev"].notna()
+        & (df["volume_mean_20d_prev"] > 0)
+        & (volume <= df["volume_mean_20d_prev"] * LOW_VOLUME_LIMIT_RATIO)
+    )
+
+    df["is_low_volume_limit_up"] = (
+        low_volume
+        & pct_chg.notna()
+        & (pct_chg >= df["limit_pct"])
+    ).astype("int8")
+    df["is_low_volume_limit_down"] = (
+        low_volume
+        & pct_chg.notna()
+        & (pct_chg <= -df["limit_pct"])
+    ).astype("int8")
 
     return df
 
@@ -203,6 +267,9 @@ def main():
 
     print("Adding returns and labels...")
     df = add_returns_and_labels(df)
+
+    print("Adding trading constraint features...")
+    df = add_trading_constraint_features(df)
 
     print("Adding baseline features...")
     df = add_baseline_features(df)

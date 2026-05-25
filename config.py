@@ -43,16 +43,7 @@ for p in [
 
 
 # ============================================================
-# 2. Raw data paths
-# ============================================================
-# You can place one merged CSV here, or modify 01_build_panel.py
-# to read a folder of per-stock CSV files.
-
-RAW_CSV_PATH = RAW_DIR / "a_share_daily.csv"
-
-
-# ============================================================
-# 3. Standard output files
+# 2. Standard output files
 # ============================================================
 
 PANEL_PATH = PROCESSED_DIR / "panel_daily.parquet"
@@ -66,82 +57,8 @@ def meta_path_for_experiment(exp_name):
     return IMAGE_DIR / f"meta_{exp_name.lower()}.parquet"
 
 
-IMAGE_I5_PATH = image_path_for_experiment("I5R5")
-META_I5_PATH = meta_path_for_experiment("I5R5")
-
-IMAGE_I20_PATH = image_path_for_experiment("I20R20")
-META_I20_PATH = meta_path_for_experiment("I20R20")
-
-
 # ============================================================
-# 4. Column mapping
-# ============================================================
-# Left side: expected standard column name used by scripts.
-# Right side: raw Chinese column name in your data.
-#
-# You should adjust the right side according to your actual CSV.
-# If your data already uses English names, map them directly.
-
-COLUMN_MAP = {
-    "date": "日期",
-    "code": "代码",
-    "name": "名称",
-    "industry": "所属行业",
-
-    # Adjusted OHLC. If your raw file contains only one price system,
-    # temporarily map them here and treat them as adjusted prices.
-    "open_adj": "开盘价",
-    "high_adj": "最高价",
-    "low_adj": "最低价",
-    "close_adj": "收盘价",
-
-    # Raw OHLC. If you have separate non-adjusted data, merge it before this step.
-    # For MVP, we temporarily set raw = adjusted if raw fields do not exist.
-    "open_raw": "开盘价",
-    "high_raw": "最高价",
-    "low_raw": "最低价",
-    "close_raw": "收盘价",
-    "prev_close_raw": "前收盘价",
-
-    "volume": "成交量（额）",
-    "amount": "成交额（元）",
-    "turnover_rate": "换手率",
-    "pct_chg": "涨幅%",
-    "amplitude": "振幅%",
-
-    "is_st": "是否ST",
-    "volume_ratio": "量比",
-
-    "ret_3d_raw": "三日涨幅%",
-    "ret_6d_raw": "六日涨幅%",
-    "ret_10d_raw": "十日涨幅%",
-    "ret_25d_raw": "25日涨幅%",
-
-    "is_limit_up": "是否涨停",
-
-    "total_shares": "总股本（股）",
-    "float_shares": "流通股本（股）",
-    "total_mktcap": "总市值（元）",
-    "float_mktcap": "流通市值（元）",
-
-    "pe_ttm": "滚动市盈率",
-    "pb": "市净率",
-    "ps_ttm": "滚动市销率",
-
-    "ma5_adj": "5日线",
-    "ma10_adj": "10日线",
-    "ma20_adj": "20日线",
-    "ma30_adj": "30日线",
-    "ma120_adj": "120日线",
-    "ma250_adj": "250日线",
-
-    "list_date": "上市时间",
-    "delist_date": "退市时间",
-}
-
-
-# ============================================================
-# 5. Sample filters
+# 3. Sample filters
 # ============================================================
 
 START_DATE = "2014-01-01"
@@ -153,14 +70,22 @@ VALID_END = "2020-12-31"
 TEST_START = "2021-01-01"
 
 MIN_LIST_DAYS = 120
+EMBARGO_DAYS_BY_HORIZON = {
+    5: 5,
+    20: 20,
+}
+
+RANDOM_SEED = 42
+CNN_WEIGHT_DECAY = 1e-4
 
 # Main liquidity threshold.
 # You can later test 10m, 50m, 100m as robustness checks.
 MIN_AMOUNT = 20_000_000
+LOW_VOLUME_LIMIT_RATIO = 0.10
 
 
 # ============================================================
-# 6. Experiments
+# 4. Experiments
 # ============================================================
 
 DAY_WIDTH = 3
@@ -239,11 +164,10 @@ EXPERIMENTS = {
 
 
 # ============================================================
-# 7. Backtest config
+# 5. Backtest config
 # ============================================================
 
 N_DECILES = 10
-ONE_WAY_COST_BPS = 10
 COST_BPS_GRID = [0, 10, 25, 50, 100]
 UNIVERSE_SPLIT_METHOD = "daily_tercile"
 TRADING_DAYS_PER_YEAR = 252

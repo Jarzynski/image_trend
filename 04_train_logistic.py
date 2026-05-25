@@ -39,6 +39,8 @@ from config import (
     VALID_START,
     VALID_END,
     TEST_START,
+    EMBARGO_DAYS_BY_HORIZON,
+    RANDOM_SEED,
     EXPERIMENTS,
 )
 
@@ -70,13 +72,36 @@ FEATURE_COLS = [
 ]
 
 
-def get_split_masks(df):
+def cutoff_before_boundary(dates, boundary, gap_days):
     """
-    Fixed time split.
+    Return the first purged date before a split boundary.
     """
-    train_mask = df["date"] <= TRAIN_END
-    valid_mask = (df["date"] >= VALID_START) & (df["date"] <= VALID_END)
-    test_mask = df["date"] >= TEST_START
+    unique_dates = pd.DatetimeIndex(sorted(pd.to_datetime(dates).dropna().unique()))
+    boundary = pd.Timestamp(boundary)
+    before = unique_dates[unique_dates < boundary]
+    if gap_days <= 0:
+        return boundary
+    if len(before) <= gap_days:
+        return pd.Timestamp.min
+    return before[-gap_days]
+
+
+def get_split_masks(df, horizon):
+    """
+    Fixed time split with purge/embargo around validation and test boundaries.
+    """
+    date = pd.to_datetime(df["date"])
+    gap_days = max(int(horizon), int(EMBARGO_DAYS_BY_HORIZON.get(int(horizon), horizon)))
+    train_purge_start = cutoff_before_boundary(date, VALID_START, gap_days)
+    valid_purge_start = cutoff_before_boundary(date, TEST_START, gap_days)
+
+    train_mask = (date <= pd.Timestamp(TRAIN_END)) & (date < train_purge_start)
+    valid_mask = (
+        (date >= pd.Timestamp(VALID_START))
+        & (date <= pd.Timestamp(VALID_END))
+        & (date < valid_purge_start)
+    )
+    test_mask = date >= pd.Timestamp(TEST_START)
     return train_mask, valid_mask, test_mask
 
 
@@ -117,7 +142,7 @@ def train_one_experiment(df, experiment_name, cfg):
 
     sub = df[sample_mask].copy()
 
-    train_mask, valid_mask, test_mask = get_split_masks(sub)
+    train_mask, valid_mask, test_mask = get_split_masks(sub, horizon)
 
     X_train = sub.loc[train_mask, use_cols]
     y_train = sub.loc[train_mask, label_col].astype(int)
@@ -141,6 +166,7 @@ def train_one_experiment(df, experiment_name, cfg):
             max_iter=1000,
             class_weight=None,
             n_jobs=None,
+            random_state=RANDOM_SEED,
         )),
     ])
 
@@ -156,12 +182,15 @@ def train_one_experiment(df, experiment_name, cfg):
         print(f"{experiment_name} {split_name}: AUC={auc:.4f}, ACC={acc:.4f}, Brier={brier:.4f}")
 
     # Save test predictions.
-    test_sub = sub.loc[test_mask, [
+    pred_cols = [
         "date", "code", "industry",
         future_ret_col, label_col,
-        "is_tradable", "is_limit_up",
+        "is_tradable",
         "amount", "float_mktcap",
-    ]].copy()
+        "is_low_volume_limit_up", "is_low_volume_limit_down",
+    ]
+    pred_cols = [c for c in pred_cols if c in sub.columns]
+    test_sub = sub.loc[test_mask, pred_cols].copy()
 
     test_prob = model.predict_proba(X_test)[:, 1]
 

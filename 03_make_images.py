@@ -158,7 +158,8 @@ def needed_feature_columns():
     cols = {
         "date", "code", "industry", "is_tradable",
         "open_adj", "high_adj", "low_adj", "close_adj",
-        "amount", "float_mktcap", "is_limit_up",
+        "amount", "float_mktcap",
+        "is_low_volume_limit_up", "is_low_volume_limit_down",
     }
 
     for cfg in EXPERIMENTS.values():
@@ -236,7 +237,8 @@ def iter_valid_samples(df, exp_name, cfg, with_image):
                 "label": row[label_col],
                 "amount": row.get("amount", np.nan),
                 "float_mktcap": row.get("float_mktcap", np.nan),
-                "is_limit_up": row.get("is_limit_up", 0),
+                "is_low_volume_limit_up": row.get("is_low_volume_limit_up", 0),
+                "is_low_volume_limit_down": row.get("is_low_volume_limit_down", 0),
             }
 
             if with_image:

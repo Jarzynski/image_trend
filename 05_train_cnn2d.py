@@ -38,6 +38,9 @@ from config import (
     VALID_START,
     VALID_END,
     TEST_START,
+    EMBARGO_DAYS_BY_HORIZON,
+    RANDOM_SEED,
+    CNN_WEIGHT_DECAY,
     EXPERIMENTS,
     image_path_for_experiment,
     meta_path_for_experiment,
@@ -192,15 +195,47 @@ def get_device():
     return torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def get_split_masks(meta):
+def set_random_seed(seed):
     """
-    Fixed time split.
+    Set the main random seeds used by numpy and torch.
+    """
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.benchmark = False
+
+
+def cutoff_before_boundary(dates, boundary, gap_days):
+    """
+    Return the first purged date before a split boundary.
+    """
+    unique_dates = pd.DatetimeIndex(sorted(pd.to_datetime(dates).dropna().unique()))
+    boundary = pd.Timestamp(boundary)
+    before = unique_dates[unique_dates < boundary]
+    if gap_days <= 0:
+        return boundary
+    if len(before) <= gap_days:
+        return pd.Timestamp.min
+    return before[-gap_days]
+
+
+def get_split_masks(meta, horizon):
+    """
+    Fixed time split with purge/embargo around validation and test boundaries.
     """
     date = pd.to_datetime(meta["date"])
+    gap_days = max(int(horizon), int(EMBARGO_DAYS_BY_HORIZON.get(int(horizon), horizon)))
+    train_purge_start = cutoff_before_boundary(date, VALID_START, gap_days)
+    valid_purge_start = cutoff_before_boundary(date, TEST_START, gap_days)
 
-    train_mask = date <= TRAIN_END
-    valid_mask = (date >= VALID_START) & (date <= VALID_END)
-    test_mask = date >= TEST_START
+    train_mask = (date <= pd.Timestamp(TRAIN_END)) & (date < train_purge_start)
+    valid_mask = (
+        (date >= pd.Timestamp(VALID_START))
+        & (date <= pd.Timestamp(VALID_END))
+        & (date < valid_purge_start)
+    )
+    test_mask = date >= pd.Timestamp(TEST_START)
 
     return train_mask.values, valid_mask.values, test_mask.values
 
@@ -247,6 +282,8 @@ def train_one_experiment(exp_name, cfg, image_path, meta_path, n_epochs=50, batc
     """
     Train CNN for one experiment.
     """
+    set_random_seed(RANDOM_SEED)
+
     print(f"Loading images: {image_path}")
     images = np.load(image_path, mmap_mode="r")
     image_height, image_width = images.shape[1], images.shape[2]
@@ -257,7 +294,7 @@ def train_one_experiment(exp_name, cfg, image_path, meta_path, n_epochs=50, batc
 
     labels = meta["label"].values.astype(np.float32)
 
-    train_mask, valid_mask, test_mask = get_split_masks(meta)
+    train_mask, valid_mask, test_mask = get_split_masks(meta, cfg["horizon"])
 
     train_idx = np.flatnonzero(train_mask)
     valid_idx = np.flatnonzero(valid_mask)
@@ -273,6 +310,8 @@ def train_one_experiment(exp_name, cfg, image_path, meta_path, n_epochs=50, batc
 
     device = get_device()
     pin_memory = device.type == "cuda"
+    train_generator = torch.Generator()
+    train_generator.manual_seed(RANDOM_SEED)
 
     train_loader = DataLoader(
         ImageDataset(images, labels, train_idx),
@@ -280,6 +319,7 @@ def train_one_experiment(exp_name, cfg, image_path, meta_path, n_epochs=50, batc
         shuffle=True,
         num_workers=0,
         pin_memory=pin_memory,
+        generator=train_generator,
     )
 
     valid_loader = DataLoader(
@@ -304,7 +344,7 @@ def train_one_experiment(exp_name, cfg, image_path, meta_path, n_epochs=50, batc
         image_width=image_width,
     ).to(device)
 
-    optimizer = torch.optim.Adam(model.parameters(), lr=lr)
+    optimizer = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=CNN_WEIGHT_DECAY)
     criterion = nn.BCEWithLogitsLoss()
 
     best_valid_loss = np.inf
@@ -382,11 +422,14 @@ def train_one_experiment(exp_name, cfg, image_path, meta_path, n_epochs=50, batc
     print(f"Saved model to: {model_path}")
 
     # Save test predictions.
-    pred = meta.loc[test_mask, [
+    pred_cols = [
         "date", "code", "industry",
         "future_ret", "label",
-        "amount", "float_mktcap", "is_limit_up",
-    ]].copy()
+        "amount", "float_mktcap",
+        "is_low_volume_limit_up", "is_low_volume_limit_down",
+    ]
+    pred_cols = [c for c in pred_cols if c in meta.columns]
+    pred = meta.loc[test_mask, pred_cols].copy()
 
     pred["experiment_name"] = exp_name
     if "window" in meta.columns:

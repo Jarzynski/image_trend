@@ -59,7 +59,20 @@ PRED_REQUIRED_COLS = {
     "model_name",
 }
 
-DAILY_RETURN_REQUIRED_COLS = {"date", "code", "ret_1d", "open_to_close_ret_1d"}
+DAILY_RETURN_REQUIRED_COLS = {
+    "date",
+    "code",
+    "ret_1d",
+    "open_to_close_ret_1d",
+    "pct_chg",
+    "volume",
+    "is_suspended",
+    "is_low_volume_limit_up",
+    "is_low_volume_limit_down",
+}
+
+RETURN_CHECK_MAX_ROWS = 10_000
+RETURN_CHECK_TOL = 1e-6
 
 GROUP_COLS = ["experiment_name", "model_name", "universe_group"]
 PERIOD_GROUP_COLS = ["date"] + GROUP_COLS
@@ -151,6 +164,10 @@ def load_daily_returns():
         daily_ret["open_to_close_ret_1d"],
         errors="coerce",
     )
+    daily_ret["pct_chg"] = pd.to_numeric(daily_ret["pct_chg"], errors="coerce")
+    daily_ret["volume"] = pd.to_numeric(daily_ret["volume"], errors="coerce")
+    for col in ["is_suspended", "is_low_volume_limit_up", "is_low_volume_limit_down"]:
+        daily_ret[col] = pd.to_numeric(daily_ret[col], errors="coerce").fillna(0).astype("int8")
     daily_ret = daily_ret.dropna(subset=["date", "code"])
 
     if daily_ret.empty:
@@ -402,27 +419,101 @@ def calc_decile_monotonicity(decile_summary):
 
 def prepare_daily_return_lookup(daily_returns):
     """
-    Build trading calendar and date -> stock return lookups.
+    Build trading calendar and date -> per-stock execution/return lookups.
     """
     trading_dates = pd.DatetimeIndex(sorted(daily_returns["date"].dropna().unique()))
     date_to_pos = {date: i for i, date in enumerate(trading_dates)}
 
-    close_to_close_by_date = {}
-    open_to_close_by_date = {}
+    info_by_date = {}
 
     for date, group in daily_returns.groupby("date", sort=True):
-        close_to_close_by_date[pd.Timestamp(date)] = (
+        info_by_date[pd.Timestamp(date)] = (
             group
-            .groupby("code")["ret_1d"]
-            .mean()
-        )
-        open_to_close_by_date[pd.Timestamp(date)] = (
-            group
-            .groupby("code")["open_to_close_ret_1d"]
-            .mean()
+            .groupby("code")
+            .agg(
+                ret_1d=("ret_1d", "mean"),
+                open_to_close_ret_1d=("open_to_close_ret_1d", "mean"),
+                pct_chg=("pct_chg", "mean"),
+                volume=("volume", "mean"),
+                is_suspended=("is_suspended", "max"),
+                is_low_volume_limit_up=("is_low_volume_limit_up", "max"),
+                is_low_volume_limit_down=("is_low_volume_limit_down", "max"),
+            )
         )
 
-    return trading_dates, date_to_pos, close_to_close_by_date, open_to_close_by_date
+    return trading_dates, date_to_pos, info_by_date
+
+
+def get_daily_info(info_by_date, trading_dates, return_pos):
+    if return_pos < 0 or return_pos >= len(trading_dates):
+        return pd.DataFrame()
+    return info_by_date.get(pd.Timestamp(trading_dates[return_pos]), pd.DataFrame())
+
+
+def code_row(daily_info, code):
+    if daily_info.empty or code not in daily_info.index:
+        return None
+    return daily_info.loc[code]
+
+
+def is_valid_buy_row(row):
+    if row is None:
+        return False
+    if int(row.get("is_suspended", 0)) == 1:
+        return False
+    if int(row.get("is_low_volume_limit_up", 0)) == 1:
+        return False
+    if pd.isna(row.get("open_to_close_ret_1d", np.nan)):
+        return False
+    if pd.isna(row.get("volume", np.nan)) or float(row.get("volume", 0.0)) <= 0:
+        return False
+    return True
+
+
+def is_valid_sell_row(row, return_col):
+    if row is None:
+        return False
+    if int(row.get("is_suspended", 0)) == 1:
+        return False
+    if int(row.get("is_low_volume_limit_down", 0)) == 1:
+        return False
+    if pd.isna(row.get(return_col, np.nan)):
+        return False
+    return True
+
+
+def get_code_return(row, return_col):
+    if row is None:
+        return np.nan, "missing"
+
+    ret = row.get(return_col, np.nan)
+    if not pd.isna(ret):
+        return float(ret), "valid"
+
+    if int(row.get("is_suspended", 0)) == 1:
+        return 0.0, "suspended"
+
+    return np.nan, "missing"
+
+
+def filter_buyable_codes(codes, daily_info):
+    """
+    Keep only stocks that can be bought at the next open.
+    """
+    buyable = []
+    blocked = 0
+    data_missing = 0
+
+    for code in codes:
+        row = code_row(daily_info, code)
+        if is_valid_buy_row(row):
+            buyable.append(code)
+        else:
+            blocked += 1
+            if row is None or pd.isna(row.get("open_to_close_ret_1d", np.nan)):
+                data_missing += 1
+
+    return buyable, blocked, data_missing
 
 
 def unique_nonnull(values):
@@ -437,6 +528,7 @@ def make_weights_from_cohorts(cohorts):
     Average active equal-weight cohorts into one long-only target weight vector.
     """
     weights = defaultdict(float)
+    cohorts = [cohort for cohort in cohorts if cohort.get("codes")]
     if not cohorts:
         return {}
 
@@ -461,61 +553,134 @@ def calc_weight_turnover(prev_weights, next_weights):
     return float(sum(abs(next_weights.get(code, 0.0) - prev_weights.get(code, 0.0)) for code in codes))
 
 
-def calc_weighted_return(weights, daily_return):
-    """
-    Long-only weighted return. Missing stock returns are treated as zero.
-    """
-    if not weights:
-        return np.nan, 0
-
-    codes = list(weights)
-    weight_array = np.array([weights[code] for code in codes], dtype=float)
-    ret = daily_return.reindex(codes)
-    missing_returns = int(ret.isna().sum())
-    ret_array = ret.fillna(0.0).astype(float).values
-
-    return float(np.dot(weight_array, ret_array)), missing_returns
-
-
-def calc_cohort_return(cohort, close_to_close_return, open_to_close_return, return_pos):
+def calc_cohort_return(cohort, daily_info, return_pos):
     """
     Return for one equal-weight signal cohort on one holding day.
     """
-    if return_pos == cohort["start_pos"]:
-        daily_return = open_to_close_return
-    else:
-        daily_return = close_to_close_return
+    return_col = "open_to_close_ret_1d" if return_pos == cohort["start_pos"] else "ret_1d"
+    returns = []
+    data_missing = 0
 
-    codes = cohort["codes"]
-    if not codes:
-        return np.nan, 0
+    for code in cohort["codes"]:
+        ret, status = get_code_return(code_row(daily_info, code), return_col)
+        if status == "missing":
+            data_missing += 1
+        if not pd.isna(ret):
+            returns.append(ret)
 
-    weights = {code: 1.0 / len(codes) for code in codes}
-    return calc_weighted_return(weights, daily_return)
+    if data_missing > 0 or not returns:
+        return np.nan, data_missing
+
+    return float(np.mean(returns)), data_missing
 
 
-def calc_active_cohort_return(active_cohorts, close_to_close_return, open_to_close_return, return_pos):
+def calc_active_cohort_return(active_cohorts, daily_info, return_pos):
     """
     Average active cohort returns into one long-only portfolio return.
     """
     returns = []
-    missing_returns = 0
+    data_missing = 0
 
     for cohort in active_cohorts:
-        cohort_ret, cohort_missing = calc_cohort_return(
-            cohort,
-            close_to_close_return,
-            open_to_close_return,
-            return_pos,
-        )
+        cohort_ret, cohort_missing = calc_cohort_return(cohort, daily_info, return_pos)
         if not pd.isna(cohort_ret):
             returns.append(cohort_ret)
-        missing_returns += cohort_missing
+        data_missing += cohort_missing
 
-    if not returns:
-        return np.nan, missing_returns
+    if data_missing > 0 or not returns:
+        return np.nan, data_missing
 
-    return float(np.mean(returns)), missing_returns
+    return float(np.mean(returns)), data_missing
+
+
+def process_sell_attempts(active_cohorts, daily_info, return_pos):
+    """
+    Sell codes whose holding period ended unless execution is blocked.
+    """
+    next_active = []
+    blocked_sells = 0
+    forced_holds = 0
+    data_missing = 0
+
+    for cohort in active_cohorts:
+        if return_pos < cohort["target_end_pos"]:
+            next_active.append(cohort)
+            continue
+
+        return_col = "open_to_close_ret_1d" if return_pos == cohort["start_pos"] else "ret_1d"
+        keep_codes = []
+        for code in cohort["codes"]:
+            row = code_row(daily_info, code)
+            if is_valid_sell_row(row, return_col):
+                continue
+
+            keep_codes.append(code)
+            blocked_sells += 1
+            forced_holds += 1
+            if row is None or pd.isna(row.get(return_col, np.nan)):
+                data_missing += 1
+
+        if keep_codes:
+            next_cohort = cohort.copy()
+            next_cohort["codes"] = keep_codes
+            next_active.append(next_cohort)
+
+    return next_active, blocked_sells, forced_holds, data_missing
+
+
+def compound_return_for_row(row, trading_dates, date_to_pos, info_by_date):
+    """
+    Rebuild one future return from daily open-to-close and close-to-close returns.
+    """
+    signal_pos = date_to_pos.get(pd.Timestamp(row["date"]))
+    if signal_pos is None:
+        return np.nan
+
+    horizon = int(row["horizon"])
+    start_pos = signal_pos + 1
+    end_pos = signal_pos + horizon
+    if start_pos >= len(trading_dates) or end_pos >= len(trading_dates):
+        return np.nan
+
+    gross = 1.0
+    for pos in range(start_pos, end_pos + 1):
+        info = get_daily_info(info_by_date, trading_dates, pos)
+        return_col = "open_to_close_ret_1d" if pos == start_pos else "ret_1d"
+        ret, status = get_code_return(code_row(info, row["code"]), return_col)
+        if status == "missing" or pd.isna(ret):
+            return np.nan
+        gross *= 1.0 + ret
+
+    return gross - 1.0
+
+
+def warn_if_compound_returns_mismatch(pred, trading_dates, date_to_pos, info_by_date):
+    """
+    Check that configured future returns match compounded daily returns.
+    """
+    sample = pred[["date", "code", "horizon", "future_ret"]].dropna().head(RETURN_CHECK_MAX_ROWS)
+    if sample.empty:
+        return
+
+    diffs = []
+    checked = 0
+    for row in sample.to_dict("records"):
+        rebuilt = compound_return_for_row(row, trading_dates, date_to_pos, info_by_date)
+        if pd.isna(rebuilt):
+            continue
+        checked += 1
+        diffs.append(abs(float(row["future_ret"]) - rebuilt))
+
+    if not diffs:
+        print("[Warning] Return compounding check skipped: no rows with complete daily returns.")
+        return
+
+    max_diff = max(diffs)
+    if max_diff > RETURN_CHECK_TOL:
+        print(
+            "[Warning] Future-return compounding check exceeded tolerance: "
+            f"checked={checked}, max_abs_diff={max_diff:.8g}, tol={RETURN_CHECK_TOL}"
+        )
 
 
 def build_signal_cohorts(group, date_to_pos, max_date_pos):
@@ -555,7 +720,7 @@ def build_signal_cohorts(group, date_to_pos, max_date_pos):
         signals_by_pos[start_pos].append({
             "decile": decile,
             "start_pos": start_pos,
-            "end_pos": end_pos,
+            "target_end_pos": end_pos,
             "codes": codes,
         })
         max_end_pos = max(max_end_pos, end_pos)
@@ -571,16 +736,12 @@ def calc_overlapping_portfolios(pred, daily_returns):
     if signals.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    (
-        trading_dates,
-        date_to_pos,
-        close_to_close_by_date,
-        open_to_close_by_date,
-    ) = prepare_daily_return_lookup(daily_returns)
+    trading_dates, date_to_pos, info_by_date = prepare_daily_return_lookup(daily_returns)
     if len(trading_dates) == 0:
         return pd.DataFrame(), pd.DataFrame()
 
-    empty_return = pd.Series(dtype=float)
+    warn_if_compound_returns_mismatch(signals, trading_dates, date_to_pos, info_by_date)
+
     portfolio_rows = []
     turnover_rows = []
     max_date_pos = len(trading_dates) - 1
@@ -595,19 +756,30 @@ def calc_overlapping_portfolios(pred, daily_returns):
         active = {decile: [] for decile in range(1, N_DECILES + 1)}
         prev_weights = {decile: {} for decile in range(1, N_DECILES + 1)}
 
-        for return_pos in range(min_start_pos, max_end_pos + 1):
-            for cohort in signals_by_pos.get(return_pos, []):
-                active[cohort["decile"]].append(cohort)
-
+        for return_pos in range(min_start_pos, max_date_pos + 1):
             date = trading_dates[return_pos]
-            close_to_close_return = close_to_close_by_date.get(pd.Timestamp(date), empty_return)
-            open_to_close_return = open_to_close_by_date.get(pd.Timestamp(date), empty_return)
+            daily_info = get_daily_info(info_by_date, trading_dates, return_pos)
+            blocked_buys_by_decile = defaultdict(int)
+            buy_missing_by_decile = defaultdict(int)
+
+            for cohort in signals_by_pos.get(return_pos, []):
+                buyable_codes, blocked_buys, buy_missing = filter_buyable_codes(
+                    cohort["codes"],
+                    daily_info,
+                )
+                decile = cohort["decile"]
+                blocked_buys_by_decile[decile] += blocked_buys
+                buy_missing_by_decile[decile] += buy_missing
+                if buyable_codes:
+                    new_cohort = cohort.copy()
+                    new_cohort["codes"] = buyable_codes
+                    active[decile].append(new_cohort)
 
             for decile in range(1, N_DECILES + 1):
                 active_start = [
                     cohort
                     for cohort in active[decile]
-                    if cohort["end_pos"] >= return_pos
+                    if cohort.get("codes")
                 ]
                 active[decile] = active_start
 
@@ -617,22 +789,28 @@ def calc_overlapping_portfolios(pred, daily_returns):
 
                 weights = make_weights_from_cohorts(active_start)
                 start_turnover = calc_weight_turnover(prev_weights[decile], weights)
-                gross_return, missing_returns = calc_active_cohort_return(
+                gross_return, return_missing = calc_active_cohort_return(
                     active_start,
-                    close_to_close_return,
-                    open_to_close_return,
+                    daily_info,
                     return_pos,
                 )
 
-                active_end = [
-                    cohort
-                    for cohort in active_start
-                    if cohort["end_pos"] > return_pos
-                ]
+                (
+                    active_end,
+                    blocked_sells,
+                    forced_holds,
+                    sell_missing,
+                ) = process_sell_attempts(active_start, daily_info, return_pos)
                 end_weights = make_weights_from_cohorts(active_end)
                 end_turnover = calc_weight_turnover(weights, end_weights)
                 turnover = start_turnover + end_turnover
                 portfolio_name = f"D{decile}"
+                data_missing = (
+                    int(return_missing)
+                    + int(buy_missing_by_decile[decile])
+                    + int(sell_missing)
+                )
+                blocked_buys = int(blocked_buys_by_decile[decile])
 
                 turnover_rows.append({
                     "date": date,
@@ -646,11 +824,19 @@ def calc_overlapping_portfolios(pred, daily_returns):
                     "end_turnover": end_turnover,
                     "active_cohorts": len(active_start),
                     "num_holdings": len(weights),
-                    "num_missing_returns": missing_returns,
+                    "num_blocked_buys": blocked_buys,
+                    "num_blocked_sells": blocked_sells,
+                    "num_forced_holds": forced_holds,
+                    "num_data_missing_returns": data_missing,
                 })
 
                 for cost_bps in COST_BPS_GRID:
                     cost_rate = float(cost_bps) / 10_000.0
+                    net_return = (
+                        np.nan
+                        if pd.isna(gross_return)
+                        else gross_return - turnover * cost_rate
+                    )
                     portfolio_rows.append({
                         "date": date,
                         "experiment_name": exp_name,
@@ -663,14 +849,20 @@ def calc_overlapping_portfolios(pred, daily_returns):
                         "turnover": turnover,
                         "start_turnover": start_turnover,
                         "end_turnover": end_turnover,
-                        "net_return": gross_return - turnover * cost_rate,
+                        "net_return": net_return,
                         "active_cohorts": len(active_start),
                         "num_holdings": len(weights),
-                        "num_missing_returns": missing_returns,
+                        "num_blocked_buys": blocked_buys,
+                        "num_blocked_sells": blocked_sells,
+                        "num_forced_holds": forced_holds,
+                        "num_data_missing_returns": data_missing,
                     })
 
                 active[decile] = active_end
                 prev_weights[decile] = end_weights
+
+            if return_pos >= max_end_pos and all(not active[d] for d in range(1, N_DECILES + 1)):
+                break
 
     return pd.DataFrame(portfolio_rows), pd.DataFrame(turnover_rows)
 

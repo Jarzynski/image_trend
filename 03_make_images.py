@@ -6,7 +6,7 @@ Generate binary price images for all configured image/return experiments.
 
 Input
 -----
-data/features/baseline_features.parquet
+data/features/features_by_code_bucket/bucket=*/part-*.parquet
 
 Outputs
 -------
@@ -31,8 +31,13 @@ import pandas as pd
 import pyarrow.parquet as pq
 import shutil
 
+try:
+    from tqdm.auto import tqdm
+except ImportError:
+    tqdm = None
+
 from config import (
-    BASELINE_FEATURE_PATH,
+    FEATURE_BY_CODE_BUCKET_DIR,
     DAY_WIDTH,
     WHITE_PIXEL,
     EXPERIMENTS,
@@ -170,23 +175,49 @@ def needed_feature_columns():
     return sorted(cols)
 
 
-def load_features():
+def list_feature_bucket_files():
     """
-    Load only columns required by image generation.
+    List code-bucketed feature files produced by 02_make_labels_and_baselines.py.
     """
-    required = needed_feature_columns()
-    available = set(pq.read_schema(BASELINE_FEATURE_PATH).names)
+    files = sorted(FEATURE_BY_CODE_BUCKET_DIR.glob("bucket=*/part-*.parquet"))
+    if not files:
+        raise RuntimeError(
+            f"No code-bucketed feature files found in {FEATURE_BY_CODE_BUCKET_DIR}. "
+            "Run 02_make_labels_and_baselines.py first."
+        )
+    return files
+
+
+def progress_iter(iterable, total, desc):
+    """
+    Use tqdm when it is installed; otherwise fall back to the regular iterator.
+    """
+    if tqdm is None:
+        return iterable
+    return tqdm(iterable, total=total, desc=desc, unit="part")
+
+
+def validate_feature_schema(path, required):
+    """
+    Check one feature partition before streaming image generation.
+    """
+    available = set(pq.read_schema(path).names)
     missing = [c for c in required if c not in available]
 
     if missing:
         raise RuntimeError(
-            "Missing required columns in baseline feature file: "
+            f"Missing required columns in feature partition {path}: "
             + ", ".join(missing)
         )
 
-    print(f"Reading features: {BASELINE_FEATURE_PATH}")
-    df = pd.read_parquet(BASELINE_FEATURE_PATH, columns=required)
+
+def read_feature_bucket_part(path, required):
+    """
+    Read one code-bucket feature part.
+    """
+    df = pd.read_parquet(path, columns=required)
     df["date"] = pd.to_datetime(df["date"])
+    df["code"] = df["code"].astype(str).str.zfill(6)
     return df.sort_values(["code", "date"]).reset_index(drop=True)
 
 
@@ -280,11 +311,14 @@ def write_image_shard(exp_name, shard_id, image_rows, meta_rows):
     return len(meta)
 
 
-def generate_images_for_experiment(df, exp_name, cfg):
+def generate_images_for_experiment(feature_files, exp_name, cfg):
     """
     Generate one experiment's image shards and metadata shards.
     """
     clear_experiment_image_dir(exp_name)
+
+    required = needed_feature_columns()
+    validate_feature_schema(feature_files[0], required)
 
     image_rows = []
     meta_rows = []
@@ -292,16 +326,22 @@ def generate_images_for_experiment(df, exp_name, cfg):
     written = 0
 
     print(f"Writing sharded images to: {image_dir_for_experiment(exp_name)}")
-    for img, meta in iter_valid_samples(df, exp_name, cfg, with_image=True):
-        image_rows.append(img)
-        meta_rows.append(meta)
+    file_iter = progress_iter(feature_files, total=len(feature_files), desc=f"Images {exp_name}")
+    for i, path in enumerate(file_iter, start=1):
+        if tqdm is None and (i == 1 or i % 500 == 0 or i == len(feature_files)):
+            print(f"{exp_name} processing {i}/{len(feature_files)}: {path.parent.name}")
 
-        if len(image_rows) >= IMAGE_SHARD_SIZE:
-            written += write_image_shard(exp_name, shard_id, image_rows, meta_rows)
-            print(f"{exp_name} wrote shard {shard_id:05d}: {len(image_rows)} samples")
-            shard_id += 1
-            image_rows = []
-            meta_rows = []
+        df = read_feature_bucket_part(path, required)
+        for img, meta in iter_valid_samples(df, exp_name, cfg, with_image=True):
+            image_rows.append(img)
+            meta_rows.append(meta)
+
+            if len(image_rows) >= IMAGE_SHARD_SIZE:
+                written += write_image_shard(exp_name, shard_id, image_rows, meta_rows)
+                print(f"{exp_name} wrote shard {shard_id:05d}: {len(image_rows)} samples")
+                shard_id += 1
+                image_rows = []
+                meta_rows = []
 
     if image_rows:
         written += write_image_shard(exp_name, shard_id, image_rows, meta_rows)
@@ -314,11 +354,12 @@ def generate_images_for_experiment(df, exp_name, cfg):
 
 
 def main():
-    df = load_features()
+    feature_files = list_feature_bucket_files()
+    print(f"Feature code-bucket parts: {len(feature_files)} from {FEATURE_BY_CODE_BUCKET_DIR}")
 
     for exp_name, cfg in EXPERIMENTS.items():
         print(f"Generating images for {exp_name}...")
-        generate_images_for_experiment(df, exp_name, cfg)
+        generate_images_for_experiment(feature_files, exp_name, cfg)
 
     print("Done.")
 

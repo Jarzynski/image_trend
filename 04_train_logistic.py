@@ -8,7 +8,7 @@ Train logistic regression baselines using traditional price-volume features.
 
 Input
 -----
-data/features/baseline_features.parquet
+data/features/features_by_year/year=*/part-*.parquet
 
 Output
 ------
@@ -25,6 +25,7 @@ It is mainly used to answer:
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
@@ -33,7 +34,7 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.metrics import roc_auc_score, accuracy_score, brier_score_loss
 
 from config import (
-    BASELINE_FEATURE_PATH,
+    FEATURE_BY_YEAR_DIR,
     PRED_DIR,
     TRAIN_END,
     VALID_START,
@@ -70,6 +71,60 @@ FEATURE_COLS = [
     "turnover_change_20d",
     "log_float_mktcap",
 ]
+
+
+def configured_training_columns():
+    """
+    Columns needed for all configured logistic experiments.
+    """
+    cols = {
+        "date", "code", "industry", "is_tradable",
+        "amount", "float_mktcap",
+        "is_low_volume_limit_up", "is_low_volume_limit_down",
+    }
+    cols.update(FEATURE_COLS)
+    for cfg in EXPERIMENTS.values():
+        horizon = cfg["horizon"]
+        cols.add(f"label_{horizon}d")
+        cols.add(f"future_ret_{horizon}d")
+        ma_col = cfg.get("ma_col")
+        if ma_col:
+            cols.add(ma_col)
+    return sorted(cols)
+
+
+def list_feature_year_files():
+    files = sorted(FEATURE_BY_YEAR_DIR.glob("year=*/part-*.parquet"))
+    if not files:
+        raise RuntimeError(
+            f"No year-partitioned feature files found in {FEATURE_BY_YEAR_DIR}. "
+            "Run 02_make_labels_and_baselines.py first."
+        )
+    return files
+
+
+def validate_feature_year_schema(required):
+    files = list_feature_year_files()
+    available = set(pq.read_schema(files[0]).names)
+    missing = [col for col in required if col not in available]
+    if missing:
+        raise RuntimeError(
+            f"Missing required columns in feature dataset {FEATURE_BY_YEAR_DIR}: {missing}. "
+            "Rerun 02_make_labels_and_baselines.py."
+        )
+
+
+def load_training_features():
+    """
+    Load only columns required by the logistic baseline.
+    """
+    required = configured_training_columns()
+    validate_feature_year_schema(required)
+    print(f"Reading feature dataset: {FEATURE_BY_YEAR_DIR}")
+    df = pd.read_parquet(FEATURE_BY_YEAR_DIR, columns=required)
+    df["date"] = pd.to_datetime(df["date"])
+    df["code"] = df["code"].astype(str).str.zfill(6)
+    return df
 
 
 def cutoff_before_boundary(dates, boundary, gap_days):
@@ -212,9 +267,7 @@ def train_one_experiment(df, experiment_name, cfg):
 
 
 def main():
-    print(f"Reading features: {BASELINE_FEATURE_PATH}")
-    df = pd.read_parquet(BASELINE_FEATURE_PATH)
-    df["date"] = pd.to_datetime(df["date"])
+    df = load_training_features()
 
     for experiment_name, cfg in EXPERIMENTS.items():
         train_one_experiment(df, experiment_name, cfg)

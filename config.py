@@ -48,7 +48,8 @@ for p in [
 
 PANEL_BY_CODE_DIR = PROCESSED_DIR / "panel_by_code"
 PANEL_BY_YEAR_DIR = PROCESSED_DIR / "panel_by_year"
-BASELINE_FEATURE_PATH = FEATURE_DIR / "baseline_features.parquet"
+FEATURE_BY_CODE_BUCKET_DIR = FEATURE_DIR / "features_by_code_bucket"
+FEATURE_BY_YEAR_DIR = FEATURE_DIR / "features_by_year"
 
 IMAGE_SHARD_SIZE = 10_000
 
@@ -93,6 +94,9 @@ CNN_WEIGHT_DECAY = 1e-4
 N_WORKERS = 12
 PANEL_MAX_BUFFER_ROWS = 500_000
 PANEL_ROW_GROUP_SIZE = 128_000
+FEATURE_MAX_BUFFER_ROWS = 500_000
+FEATURE_ROW_GROUP_SIZE = 128_000
+FEATURE_CODE_BUCKETS = 128
 
 # Main liquidity threshold.
 # You can later test 10m, 50m, 100m as robustness checks.

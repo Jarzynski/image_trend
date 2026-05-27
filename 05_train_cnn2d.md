@@ -38,7 +38,8 @@ N:\quant\A_share\image_trend\05_train_cnn2d.py
     -> data/processed/panel_by_year/year=*/part-*.parquet
 
 02_make_labels_and_baselines.py
-    -> data/features/baseline_features.parquet
+    -> data/features/features_by_code_bucket/bucket=*/part-*.parquet
+    -> data/features/features_by_year/year=*/part-*.parquet
 
 03_make_images.py
     -> data/images/{experiment}/shard_*/images.npy

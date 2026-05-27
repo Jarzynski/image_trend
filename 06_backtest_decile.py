@@ -15,7 +15,7 @@ close-to-close returns.
 Inputs
 ------
 outputs/predictions/pred_*.parquet
-data/features/baseline_features.parquet
+data/features/features_by_year/year=*/part-*.parquet
 
 Outputs
 -------
@@ -36,9 +36,10 @@ import glob
 
 import numpy as np
 import pandas as pd
+import pyarrow.parquet as pq
 
 from config import (
-    BASELINE_FEATURE_PATH,
+    FEATURE_BY_YEAR_DIR,
     PRED_DIR,
     TABLE_DIR,
     N_DECILES,
@@ -144,18 +145,33 @@ def load_daily_returns():
     """
     Read daily realized returns used by overlapping portfolio evaluation.
     """
-    print(f"Reading daily returns: {BASELINE_FEATURE_PATH}")
+    print(f"Reading daily returns: {FEATURE_BY_YEAR_DIR}")
+    files = sorted(FEATURE_BY_YEAR_DIR.glob("year=*/part-*.parquet"))
+    if not files:
+        raise RuntimeError(
+            f"No year-partitioned feature files found in {FEATURE_BY_YEAR_DIR}. "
+            "Run 02_make_labels_and_baselines.py first."
+        )
+
+    available = set(pq.read_schema(files[0]).names)
+    missing = sorted(DAILY_RETURN_REQUIRED_COLS - available)
+    if missing:
+        raise RuntimeError(
+            f"{FEATURE_BY_YEAR_DIR} must include {missing}. "
+            "Rerun 02_make_labels_and_baselines.py after this execution-return update."
+        )
+
     try:
         daily_ret = pd.read_parquet(
-            BASELINE_FEATURE_PATH,
+            FEATURE_BY_YEAR_DIR,
             columns=sorted(DAILY_RETURN_REQUIRED_COLS),
         )
     except Exception as exc:
         raise RuntimeError(
-            f"{BASELINE_FEATURE_PATH} must include {sorted(DAILY_RETURN_REQUIRED_COLS)}. "
+            f"{FEATURE_BY_YEAR_DIR} must include {sorted(DAILY_RETURN_REQUIRED_COLS)}. "
             "Rerun 02_make_labels_and_baselines.py after this execution-return update."
         ) from exc
-    require_columns(daily_ret, DAILY_RETURN_REQUIRED_COLS, str(BASELINE_FEATURE_PATH))
+    require_columns(daily_ret, DAILY_RETURN_REQUIRED_COLS, str(FEATURE_BY_YEAR_DIR))
 
     daily_ret = daily_ret.copy()
     daily_ret["date"] = pd.to_datetime(daily_ret["date"])
@@ -171,7 +187,7 @@ def load_daily_returns():
     daily_ret = daily_ret.dropna(subset=["date", "code"])
 
     if daily_ret.empty:
-        raise RuntimeError(f"{BASELINE_FEATURE_PATH} has no valid daily return rows.")
+        raise RuntimeError(f"{FEATURE_BY_YEAR_DIR} has no valid daily return rows.")
 
     return daily_ret
 

@@ -42,8 +42,8 @@ N:\quant\A_share\image_trend\05_train_cnn2d.py
     -> data/features/features_by_year/year=*/part-*.parquet
 
 03_make_images.py
-    -> data/images/{experiment}/shard_*/images.npy
-    -> data/images/{experiment}/shard_*/meta.parquet
+    -> data/images/window_{window}/shard_*/images.npy
+    -> data/images/window_{window}/shard_*/meta.parquet
 
 05_train_cnn2d.py
     -> outputs/models/jiang_cnn2d_{experiment}.pt
@@ -59,20 +59,18 @@ N:\quant\A_share\image_trend\05_train_cnn2d.py
 
 ### 3.1 图像数组
 
-路径由 `config.image_dir_for_experiment(exp_name)` 生成：
+路径由 `config.image_dir_for_window(window)` 生成。同一图像窗口只存一份，例如 `I20R5` 和 `I20R20` 共同读取 `window_20`。
 
 ```text
-data/images/{experiment_name.lower()}/shard_*/images.npy
+data/images/window_{window}/shard_*/images.npy
 ```
 
 示例：
 
 ```text
-data/images/i5r5/shard_00000/images.npy
-data/images/i20r5/shard_00000/images.npy
-data/images/i60r5/shard_00000/images.npy
-data/images/i20r20/shard_00000/images.npy
-data/images/i60r20/shard_00000/images.npy
+data/images/window_5/shard_00000/images.npy
+data/images/window_20/shard_00000/images.npy
+data/images/window_60/shard_00000/images.npy
 ```
 
 格式：
@@ -106,20 +104,18 @@ images = np.load(shard_image_path, mmap_mode="r")
 
 ### 3.2 图像 metadata
 
-路径由 `config.image_dir_for_experiment(exp_name)` 生成：
+路径由 `config.image_dir_for_window(window)` 生成：
 
 ```text
-data/images/{experiment_name.lower()}/shard_*/meta.parquet
+data/images/window_{window}/shard_*/meta.parquet
 ```
 
 示例：
 
 ```text
-data/images/i5r5/shard_00000/meta.parquet
-data/images/i20r5/shard_00000/meta.parquet
-data/images/i60r5/shard_00000/meta.parquet
-data/images/i20r20/shard_00000/meta.parquet
-data/images/i60r20/shard_00000/meta.parquet
+data/images/window_5/shard_00000/meta.parquet
+data/images/window_20/shard_00000/meta.parquet
+data/images/window_60/shard_00000/meta.parquet
 ```
 
 格式：
@@ -135,18 +131,19 @@ data/images/i60r20/shard_00000/meta.parquet
 | `date` | 当前图像窗口结束日，也是预测发出日 |
 | `code` | 股票代码 |
 | `industry` | 行业 |
-| `experiment_name` | 实验名 |
 | `window` | 图像窗口长度，例如 5、20、60 |
-| `horizon` | 预测未来收益周期，例如 5、20 |
-| `future_ret` | 未来收益率，来自 `future_ret_{horizon}d` |
-| `label` | 二分类标签，未来收益大于 0 为 1，否则为 0 |
+| `label_{h}d` | horizon 为 `h` 的二分类标签，例如 `label_5d`、`label_20d` |
+| `future_ret_{h}d` | horizon 为 `h` 的未来收益，例如 `future_ret_5d`、`future_ret_20d` |
 | `amount` | 当日成交额 |
 | `float_mktcap` | 流通市值 |
-| `is_limit_up` | 是否涨停 |
+| `is_low_volume_limit_up` | 低量涨停不可买标记 |
+| `is_low_volume_limit_down` | 低量跌停不可卖标记 |
 | `image_height` | 图像高度 |
 | `image_width` | 图像宽度 |
 | `price_height` | 价格区域高度 |
 | `volume_height` | 成交量区域高度 |
+
+`05_train_cnn2d.py` 读取 metadata 后，会按当前实验的 `horizon` 生成临时视图列 `future_ret` 和 `label`，用于训练和预测输出。
 
 ## 4. 输出文件
 
@@ -295,7 +292,7 @@ from config import (...)
 | `VALID_END` | 验证集结束日期 |
 | `TEST_START` | 测试集开始日期 |
 | `EXPERIMENTS` | 实验矩阵配置 |
-| `image_dir_for_experiment` | 根据实验名生成 shard 根目录 |
+| `image_dir_for_window` | 根据图像窗口生成 shard 根目录 |
 
 ## 7. 全流程概览
 
@@ -309,7 +306,7 @@ if __name__ == "__main__":
 `main()` 执行以下流程：
 
 1. 遍历 `config.EXPERIMENTS` 中的所有实验。
-2. 对每个实验定位 shard 根目录。
+2. 对每个实验按 `cfg["window"]` 定位共享 shard 根目录。
 3. 调用 `train_one_experiment(...)`。
 4. 在 `train_one_experiment(...)` 内部：
    - 读取全部图像 shard；
@@ -1175,8 +1172,9 @@ def train_one_experiment(exp_name, cfg, n_epochs=50, batch_size=128, lr=1e-5):
 ### 8.7.1 加载图像 shard 和 metadata
 
 ```python
-print(f"Loading image shards: {image_dir_for_experiment(exp_name)}")
-image_shards, meta = load_image_shards(exp_name)
+print(f"Loading image shards: {image_dir_for_window(cfg['window'])}")
+image_shards, meta = load_image_shards(exp_name, cfg)
+meta = select_experiment_label_view(meta, exp_name, cfg)
 image_height, image_width = image_shards[0].shape[1], image_shards[0].shape[2]
 ```
 
@@ -1185,7 +1183,7 @@ image_height, image_width = image_shards[0].shape[1], image_shards[0].shape[2]
 | 变量 | 含义 |
 |---|---|
 | `image_shards` | 多个 shard 的图像 memmap 列表 |
-| `meta` | 合并后的 metadata 表 |
+| `meta` | 合并后的 metadata 表，并已按当前 experiment 的 horizon 选择 `label/future_ret` |
 | `image_height` | 图像高度 |
 | `image_width` | 图像宽度 |
 
@@ -1616,7 +1614,7 @@ def main():
 |---|---|
 | `exp_name` | 实验名，例如 `I60R20` |
 | `cfg` | 当前实验配置 |
-| `image_dir_for_experiment(exp_name)` | 当前实验 shard 根目录 |
+| `image_dir_for_window(cfg["window"])` | 当前实验对应 window 的共享 shard 根目录 |
 
 当前执行顺序由 `config.EXPERIMENTS` 的字典顺序决定。
 
@@ -1805,7 +1803,7 @@ uv run python 05_train_cnn2d.py
 前提：
 
 1. 已运行 `03_make_images.py`；
-2. `data/images/{experiment}/shard_*/` 下已有所有实验的 `images.npy` 和 `meta.parquet`；
+2. `data/images/window_{window}/shard_*/` 下已有所需窗口的 `images.npy` 和 `meta.parquet`；
 3. Python 环境中已有 `numpy/pandas/pyarrow/torch/scikit-learn`；
 4. GPU 环境可用时，PyTorch 能正确识别 CUDA。
 
@@ -1817,7 +1815,7 @@ uv run python 05_train_cnn2d.py
 
 - 未运行 `03_make_images.py`；
 - 实验配置改过，但旧图像没有重新生成；
-- 文件名与 `image_dir_for_experiment(exp_name)` 不一致。
+- 文件名与 `image_dir_for_window(cfg["window"])` 不一致。
 
 处理：
 

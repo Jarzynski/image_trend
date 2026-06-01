@@ -8,8 +8,8 @@ Train Jiang, Kelly, and Xiu-style 2D CNNs on binary price images.
 
 Inputs
 ------
-data/images/{experiment_name}/shard_*/images.npy
-data/images/{experiment_name}/shard_*/meta.parquet
+data/images/window_{window}/shard_*/images.npy
+data/images/window_{window}/shard_*/meta.parquet
 
 Outputs
 -------
@@ -42,7 +42,7 @@ from config import (
     RANDOM_SEED,
     CNN_WEIGHT_DECAY,
     EXPERIMENTS,
-    image_dir_for_experiment,
+    image_dir_for_window,
 )
 
 
@@ -283,11 +283,15 @@ def evaluate_model(model, loader, device, criterion):
     return probs, labels, auc, acc, brier, avg_loss
 
 
-def load_image_shards(exp_name):
+def load_image_shards(exp_name, cfg):
     """
-    Load all image shards and metadata shards for one experiment.
+    Load all image shards and metadata shards for one experiment's image window.
+
+    Multiple experiments can share the same physical image directory. The
+    caller later selects label_{horizon}d/future_ret_{horizon}d for the target
+    experiment.
     """
-    image_dir = image_dir_for_experiment(exp_name)
+    image_dir = image_dir_for_window(cfg["window"])
     shard_dirs = sorted(image_dir.glob("shard_*"))
     if not shard_dirs:
         raise RuntimeError(f"No image shards found for {exp_name}: {image_dir}")
@@ -324,14 +328,41 @@ def load_image_shards(exp_name):
     return image_shards, meta
 
 
+def select_experiment_label_view(meta, exp_name, cfg):
+    """
+    Return metadata rows with finite labels for the experiment horizon.
+    """
+    horizon = int(cfg["horizon"])
+    label_col = f"label_{horizon}d"
+    future_ret_col = f"future_ret_{horizon}d"
+    missing = [c for c in [label_col, future_ret_col] if c not in meta.columns]
+    if missing:
+        raise RuntimeError(
+            f"Image metadata for {exp_name} is missing columns: {missing}. "
+            "Rerun 03_make_images.py with this experiment selected."
+        )
+
+    valid = meta[label_col].notna() & meta[future_ret_col].notna()
+    view = meta.loc[valid].copy().reset_index(drop=True)
+    if view.empty:
+        raise RuntimeError(f"{exp_name} has no rows with finite {label_col}/{future_ret_col}.")
+
+    view["experiment_name"] = exp_name
+    view["horizon"] = horizon
+    view["label"] = view[label_col].astype(np.float32)
+    view["future_ret"] = view[future_ret_col].astype(np.float32)
+    return view
+
+
 def train_one_experiment(exp_name, cfg, n_epochs=50, batch_size=128, lr=1e-5):
     """
     Train CNN for one experiment.
     """
     set_random_seed(RANDOM_SEED)
 
-    print(f"Loading image shards: {image_dir_for_experiment(exp_name)}")
-    image_shards, meta = load_image_shards(exp_name)
+    print(f"Loading image shards: {image_dir_for_window(cfg['window'])}")
+    image_shards, meta = load_image_shards(exp_name, cfg)
+    meta = select_experiment_label_view(meta, exp_name, cfg)
     image_height, image_width = image_shards[0].shape[1], image_shards[0].shape[2]
 
     labels = meta["label"].values.astype(np.float32)
@@ -476,10 +507,8 @@ def train_one_experiment(exp_name, cfg, n_epochs=50, batch_size=128, lr=1e-5):
     pred = meta.loc[test_mask, pred_cols].copy()
 
     pred["experiment_name"] = exp_name
-    if "window" in meta.columns:
-        pred["window"] = meta.loc[test_mask, "window"].values
-    if "horizon" in meta.columns:
-        pred["horizon"] = meta.loc[test_mask, "horizon"].values
+    pred["window"] = int(cfg["window"])
+    pred["horizon"] = int(cfg["horizon"])
     pred["model_name"] = "JiangCNN2D"
     pred["pred_prob"] = test_prob
 

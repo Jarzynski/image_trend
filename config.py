@@ -54,6 +54,22 @@ FEATURE_BY_YEAR_DIR = FEATURE_DIR / "features_by_year"
 IMAGE_SHARD_SIZE = 10_000
 
 
+def image_dir_for_window(window):
+    return IMAGE_DIR / f"window_{int(window)}"
+
+
+def shard_dir_for_window(window, shard_id):
+    return image_dir_for_window(window) / f"shard_{shard_id:05d}"
+
+
+def shard_image_path_for_window(window, shard_id):
+    return shard_dir_for_window(window, shard_id) / "images.npy"
+
+
+def shard_meta_path_for_window(window, shard_id):
+    return shard_dir_for_window(window, shard_id) / "meta.parquet"
+
+
 def image_dir_for_experiment(exp_name):
     return IMAGE_DIR / exp_name.lower()
 

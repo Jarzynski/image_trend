@@ -27,6 +27,7 @@ outputs/tables/decile_summary.csv
 outputs/tables/decile_monotonicity.csv
 outputs/tables/portfolio_returns.csv
 outputs/tables/portfolio_turnover.csv
+outputs/tables/portfolio_nav.csv
 outputs/tables/performance_summary.csv
 outputs/tables/cost_sensitivity.csv
 outputs/tables/return_attribution.csv
@@ -639,24 +640,53 @@ def get_code_return(row, return_col):
     return np.nan, "missing"
 
 
-def filter_buyable_codes(codes, daily_info):
+def filter_buyable_code_ids(code_ids, daily_info):
     """
     Keep only stocks that can be bought at the next open.
+
+    Cohorts store integer code ids so the hot path can use vectorized array
+    lookups instead of repeated code -> row dictionary access.
     """
-    buyable = []
-    blocked = 0
-    data_missing = 0
+    code_ids = np.asarray(code_ids, dtype=np.int32)
+    if len(code_ids) == 0:
+        return code_ids, 0, 0
+    if daily_info is None:
+        return np.empty(0, dtype=np.int32), int(len(code_ids)), int(len(code_ids))
 
-    for code in codes:
-        row = code_row(daily_info, code)
-        if is_valid_buy_row(row):
-            buyable.append(code)
-        else:
-            blocked += 1
-            if row is None or pd.isna(row[ROW_OPEN_TO_CLOSE_RET_1D]):
-                data_missing += 1
+    lookup, date_pos = daily_info
+    valid_id = code_ids >= 0
+    safe_ids = code_ids[valid_id]
 
-    return buyable, blocked, data_missing
+    present = np.zeros(len(code_ids), dtype=bool)
+    open_ret = np.full(len(code_ids), np.nan, dtype=lookup["open_to_close_ret_1d"].dtype)
+    volume = np.full(len(code_ids), np.nan, dtype=lookup["volume"].dtype)
+    suspended = np.ones(len(code_ids), dtype=bool)
+    low_volume_limit_up = np.zeros(len(code_ids), dtype=bool)
+
+    if len(safe_ids):
+        present_valid = lookup["present"][date_pos, safe_ids]
+        valid_positions = np.flatnonzero(valid_id)
+        present[valid_positions] = present_valid
+        open_ret[valid_positions] = lookup["open_to_close_ret_1d"][date_pos, safe_ids]
+        volume[valid_positions] = lookup["volume"][date_pos, safe_ids]
+        suspended[valid_positions] = lookup["is_suspended"][date_pos, safe_ids].astype(bool)
+        low_volume_limit_up[valid_positions] = lookup["is_low_volume_limit_up"][date_pos, safe_ids].astype(bool)
+
+    buyable_mask = (
+        valid_id
+        & present
+        & (~suspended)
+        & (~low_volume_limit_up)
+        & np.isfinite(open_ret)
+        & np.isfinite(volume)
+        & (volume > 0)
+    )
+    data_missing_mask = (~valid_id) | (~present) | ~np.isfinite(open_ret)
+    return (
+        code_ids[buyable_mask].astype(np.int32, copy=False),
+        int((~buyable_mask).sum()),
+        int(data_missing_mask.sum()),
+    )
 
 
 def unique_nonnull(values):
@@ -675,9 +705,9 @@ def unique_nonnull(values):
     return result
 
 
-def make_weights_from_cohorts(cohorts):
+def make_weight_state_from_cohorts(cohorts):
     """
-    Convert independent subportfolio cohorts into one target weight vector.
+    Convert independent subportfolio cohorts into vectorized target weights.
 
     Each signal cohort uses one horizon slot. A 20-day signal therefore receives
     1/20 total portfolio weight, split equally across stocks in that cohort.
@@ -685,24 +715,57 @@ def make_weights_from_cohorts(cohorts):
     under-invested. Forced-hold cohorts can extend realized exposure beyond the
     target horizon and are tracked through diagnostics.
     """
-    weights = defaultdict(float)
-    cohorts = [cohort for cohort in cohorts if cohort.get("codes")]
-    if not cohorts:
-        return {}
+    id_parts = []
+    weight_parts = []
+    static_missing_weight = 0.0
+    static_missing_count = 0
 
     for cohort in cohorts:
-        codes = cohort["codes"]
-        if not codes:
+        n_codes = int(cohort.get("n_codes", 0))
+        if n_codes <= 0:
             continue
         horizon = int(cohort.get("horizon", 0))
         if horizon <= 0:
             continue
-        cohort_weight = 1.0 / horizon
-        stock_weight = cohort_weight / len(codes)
-        for code in codes:
-            weights[code] += stock_weight
 
-    return dict(weights)
+        stock_weight = (1.0 / horizon) / n_codes
+        code_ids = np.asarray(cohort.get("code_ids", np.empty(0, dtype=np.int32)), dtype=np.int32)
+        known_ids = code_ids[code_ids >= 0]
+        if len(known_ids):
+            id_parts.append(known_ids)
+            weight_parts.append(np.full(len(known_ids), stock_weight, dtype=np.float64))
+
+        missing_count = n_codes - len(known_ids)
+        if missing_count > 0:
+            static_missing_count += int(missing_count)
+            static_missing_weight += float(missing_count * stock_weight)
+
+    if not id_parts:
+        return {
+            "ids": np.empty(0, dtype=np.int32),
+            "weights": np.empty(0, dtype=np.float64),
+            "static_missing_weight": static_missing_weight,
+            "static_missing_count": static_missing_count,
+        }
+
+    ids = np.concatenate(id_parts).astype(np.int32, copy=False)
+    weights = np.concatenate(weight_parts).astype(np.float64, copy=False)
+    unique_ids, inverse = np.unique(ids, return_inverse=True)
+    summed_weights = np.bincount(inverse, weights=weights).astype(np.float64, copy=False)
+    return {
+        "ids": unique_ids.astype(np.int32, copy=False),
+        "weights": summed_weights,
+        "static_missing_weight": static_missing_weight,
+        "static_missing_count": static_missing_count,
+    }
+
+
+def make_weights_from_cohorts(cohorts):
+    """
+    Compatibility helper returning a dict-like target vector.
+    """
+    state = make_weight_state_from_cohorts(cohorts)
+    return dict(zip(state["ids"].tolist(), state["weights"].tolist()))
 
 
 def calc_weight_turnover(prev_weights, next_weights):
@@ -713,7 +776,43 @@ def calc_weight_turnover(prev_weights, next_weights):
     return float(sum(abs(next_weights.get(code, 0.0) - prev_weights.get(code, 0.0)) for code in codes))
 
 
-def calc_weighted_return(weights, daily_info, return_pos, start_pos_by_code):
+def calc_weight_turnover_states(prev_state, next_state):
+    """
+    Sum absolute target-weight changes for sorted vector weight states.
+    """
+    prev_ids = prev_state["ids"]
+    next_ids = next_state["ids"]
+    if len(prev_ids) == 0 and len(next_ids) == 0:
+        return 0.0
+    all_ids = np.union1d(prev_ids, next_ids)
+    prev_aligned = np.zeros(len(all_ids), dtype=np.float64)
+    next_aligned = np.zeros(len(all_ids), dtype=np.float64)
+    if len(prev_ids):
+        pos = np.searchsorted(all_ids, prev_ids)
+        prev_aligned[pos] = prev_state["weights"]
+    if len(next_ids):
+        pos = np.searchsorted(all_ids, next_ids)
+        next_aligned[pos] = next_state["weights"]
+    return float(np.abs(next_aligned - prev_aligned).sum())
+
+
+def start_ids_from_cohorts(cohorts, return_pos):
+    """
+    Code ids that require open-to-close returns on this holding day.
+    """
+    parts = [
+        np.asarray(cohort.get("code_ids", np.empty(0, dtype=np.int32)), dtype=np.int32)
+        for cohort in cohorts
+        if int(cohort.get("start_pos", -1)) == int(return_pos)
+    ]
+    if not parts:
+        return np.empty(0, dtype=np.int32)
+    ids = np.concatenate(parts)
+    ids = ids[ids >= 0]
+    return np.unique(ids).astype(np.int32, copy=False)
+
+
+def calc_weighted_return_state(weight_state, daily_info, start_ids):
     """
     Weighted average return using only valid marked prices.
 
@@ -721,21 +820,53 @@ def calc_weighted_return(weights, daily_info, return_pos, start_pos_by_code):
     no longer turns the entire portfolio day into NaN. valid_weight and
     missing_weight make the coverage loss explicit for performance diagnostics.
     """
-    weighted_return = 0.0
-    valid_weight = 0.0
-    missing_weight = 0.0
-    data_missing = 0
+    ids = weight_state["ids"]
+    weights = weight_state["weights"]
+    static_missing_weight = float(weight_state.get("static_missing_weight", 0.0))
+    static_missing_count = int(weight_state.get("static_missing_count", 0))
+    if len(ids) == 0:
+        if static_missing_weight > 0:
+            return {
+                "return": np.nan,
+                "weighted_return": np.nan,
+                "valid_weight": 0.0,
+                "missing_weight": static_missing_weight,
+                "data_missing": static_missing_count,
+            }
+        return empty_return_info(0.0)
 
-    for code, weight in weights.items():
-        return_col = "open_to_close_ret_1d" if return_pos == start_pos_by_code.get(code) else "ret_1d"
-        ret, status = get_code_return(code_row(daily_info, code), return_col)
-        if status == "missing":
-            data_missing += 1
-            missing_weight += weight
-            continue
-        if not pd.isna(ret):
-            valid_weight += weight
-            weighted_return += weight * ret
+    if daily_info is None:
+        return {
+            "return": np.nan,
+            "weighted_return": np.nan,
+            "valid_weight": 0.0,
+            "missing_weight": float(weights.sum() + static_missing_weight),
+            "data_missing": int(len(ids) + static_missing_count),
+        }
+
+    lookup, date_pos = daily_info
+    present = lookup["present"][date_pos, ids]
+    use_open = np.isin(ids, start_ids, assume_unique=True)
+    ret = lookup["ret_1d"][date_pos, ids].astype(np.float64, copy=True)
+    if use_open.any():
+        ret[use_open] = lookup["open_to_close_ret_1d"][date_pos, ids[use_open]]
+    suspended = lookup["is_suspended"][date_pos, ids].astype(bool)
+
+    finite_ret = np.isfinite(ret)
+    suspended_zero = present & (~finite_ret) & suspended
+    valid_mask = present & (finite_ret | suspended_zero)
+    ret[suspended_zero] = 0.0
+
+    if valid_mask.any():
+        valid_weight = float(weights[valid_mask].sum())
+        weighted_return = float(np.dot(weights[valid_mask], ret[valid_mask]))
+    else:
+        valid_weight = 0.0
+        weighted_return = np.nan
+
+    missing_mask = ~valid_mask
+    missing_weight = float(weights[missing_mask].sum() + static_missing_weight)
+    data_missing = int(missing_mask.sum() + static_missing_count)
 
     if valid_weight <= 0:
         return {
@@ -753,6 +884,25 @@ def calc_weighted_return(weights, daily_info, return_pos, start_pos_by_code):
         "missing_weight": float(missing_weight),
         "data_missing": data_missing,
     }
+
+
+def calc_weighted_return(weights, daily_info, return_pos, start_pos_by_code):
+    """
+    Compatibility wrapper for dict weights.
+    """
+    if not weights:
+        return empty_return_info(0.0)
+    state = {
+        "ids": np.asarray(list(weights), dtype=np.int32),
+        "weights": np.asarray(list(weights.values()), dtype=np.float64),
+        "static_missing_weight": 0.0,
+        "static_missing_count": 0,
+    }
+    start_ids = np.asarray(
+        [code for code in weights if start_pos_by_code.get(code) == return_pos],
+        dtype=np.int32,
+    )
+    return calc_weighted_return_state(state, daily_info, start_ids)
 
 
 def empty_return_info(return_value=0.0):
@@ -778,8 +928,10 @@ def start_pos_by_code_from_cohorts(cohorts):
     out = {}
     for cohort in cohorts:
         start_pos = cohort["start_pos"]
-        for code in cohort.get("codes", []):
-            out[code] = min(out.get(code, start_pos), start_pos)
+        for code in np.asarray(cohort.get("code_ids", np.empty(0, dtype=np.int32)), dtype=np.int32):
+            if code < 0:
+                continue
+            out[int(code)] = min(out.get(int(code), start_pos), start_pos)
     return out
 
 
@@ -787,8 +939,8 @@ def calc_active_cohort_return(active_cohorts, daily_info, return_pos):
     """
     Daily portfolio return from active cohorts.
     """
-    weights = make_weights_from_cohorts(active_cohorts)
-    return calc_weighted_return(weights, daily_info, return_pos, start_pos_by_code_from_cohorts(active_cohorts))
+    weight_state = make_weight_state_from_cohorts(active_cohorts)
+    return calc_weighted_return_state(weight_state, daily_info, start_ids_from_cohorts(active_cohorts, return_pos))
 
 
 def retire_expired_cohorts(active_cohorts, return_pos):
@@ -798,12 +950,21 @@ def retire_expired_cohorts(active_cohorts, return_pos):
     return [
         cohort
         for cohort in active_cohorts
-        if cohort.get("codes") and return_pos < cohort["target_end_pos"]
+        if int(cohort.get("n_codes", 0)) > 0 and return_pos < cohort["target_end_pos"]
     ]
 
 
 def finite_or_zero(value):
     return 0.0 if pd.isna(value) else float(value)
+
+
+def empty_weight_state():
+    return {
+        "ids": np.empty(0, dtype=np.int32),
+        "weights": np.empty(0, dtype=np.float64),
+        "static_missing_weight": 0.0,
+        "static_missing_count": 0,
+    }
 
 
 def process_sell_attempts(active_cohorts, daily_info, return_pos):
@@ -821,21 +982,33 @@ def process_sell_attempts(active_cohorts, daily_info, return_pos):
             continue
 
         return_col = "open_to_close_ret_1d" if return_pos == cohort["start_pos"] else "ret_1d"
-        keep_codes = []
-        for code in cohort["codes"]:
-            row = code_row(daily_info, code)
-            if is_valid_sell_row(row, return_col):
-                continue
+        code_ids = np.asarray(cohort.get("code_ids", np.empty(0, dtype=np.int32)), dtype=np.int32)
+        if len(code_ids) == 0:
+            continue
 
-            keep_codes.append(code)
-            blocked_sells += 1
-            forced_holds += 1
-            if row is None or pd.isna(row_return_value(row, return_col)):
-                data_missing += 1
+        if daily_info is None:
+            keep_ids = code_ids
+            data_missing += int(len(code_ids))
+        else:
+            lookup, date_pos = daily_info
+            present = lookup["present"][date_pos, code_ids]
+            if return_col == "open_to_close_ret_1d":
+                ret = lookup["open_to_close_ret_1d"][date_pos, code_ids]
+            else:
+                ret = lookup["ret_1d"][date_pos, code_ids]
+            suspended = lookup["is_suspended"][date_pos, code_ids].astype(bool)
+            low_down = lookup["is_low_volume_limit_down"][date_pos, code_ids].astype(bool)
+            valid_sell = present & (~suspended) & (~low_down) & np.isfinite(ret)
+            keep_ids = code_ids[~valid_sell]
+            data_missing += int(((~present) | ~np.isfinite(ret)).sum())
 
-        if keep_codes:
+        blocked_sells += int(len(keep_ids))
+        forced_holds += int(len(keep_ids))
+
+        if len(keep_ids):
             next_cohort = cohort.copy()
-            next_cohort["codes"] = keep_codes
+            next_cohort["code_ids"] = keep_ids.astype(np.int32, copy=False)
+            next_cohort["n_codes"] = int(len(keep_ids))
             next_active.append(next_cohort)
 
     return next_active, blocked_sells, forced_holds, data_missing
@@ -896,7 +1069,7 @@ def warn_if_compound_returns_mismatch(pred, trading_dates, date_to_pos, lookup):
         )
 
 
-def build_signal_cohorts(group, date_to_pos, max_date_pos):
+def build_signal_cohorts(group, date_to_pos, max_date_pos, lookup):
     """
     Convert signal rows into cohorts keyed by first holding date.
     """
@@ -924,6 +1097,8 @@ def build_signal_cohorts(group, date_to_pos, max_date_pos):
         codes = unique_nonnull(cohort["code"])
         if not codes:
             continue
+        mapped_ids = [lookup["code_to_id"].get(code, -1) for code in codes]
+        code_ids = np.asarray(mapped_ids, dtype=np.int32)
 
         start_pos = signal_pos + 1
         end_pos = min(signal_pos + horizon, max_date_pos)
@@ -935,7 +1110,8 @@ def build_signal_cohorts(group, date_to_pos, max_date_pos):
             "start_pos": start_pos,
             "target_end_pos": end_pos,
             "horizon": horizon,
-            "codes": codes,
+            "code_ids": code_ids,
+            "n_codes": int(len(code_ids)),
         })
         max_end_pos = max(max_end_pos, end_pos)
 
@@ -1134,7 +1310,7 @@ def calc_overlapping_portfolios(pred, daily_context):
             "Portfolio group start: "
             f"{exp_name}/{model_name}/{universe_group}, signal_rows={len(group):,}"
         )
-        signals_by_pos, max_end_pos = build_signal_cohorts(group, date_to_pos, max_date_pos)
+        signals_by_pos, max_end_pos = build_signal_cohorts(group, date_to_pos, max_date_pos, lookup)
         if max_end_pos < 0:
             log(
                 "Portfolio group skipped: "
@@ -1145,9 +1321,11 @@ def calc_overlapping_portfolios(pred, daily_context):
         min_start_pos = min(signals_by_pos)
         total_days = max_date_pos - min_start_pos + 1
         active = {decile: [] for decile in range(1, N_DECILES + 1)}
+        forced_active = {decile: [] for decile in range(1, N_DECILES + 1)}
+        sell_due = {decile: defaultdict(list) for decile in range(1, N_DECILES + 1)}
         ideal_active = {decile: [] for decile in range(1, N_DECILES + 1)}
         buy_constrained_active = {decile: [] for decile in range(1, N_DECILES + 1)}
-        prev_weights = {decile: {} for decile in range(1, N_DECILES + 1)}
+        prev_weights = {decile: empty_weight_state() for decile in range(1, N_DECILES + 1)}
         group_horizon = int(group["horizon"].dropna().astype(int).max())
         last_progress = perf_counter()
 
@@ -1158,16 +1336,22 @@ def calc_overlapping_portfolios(pred, daily_context):
             now = perf_counter()
             if day_i == 1 or day_i == total_days or day_i % 250 == 0 or now - last_progress >= 60:
                 active_cohorts = sum(len(active[d]) for d in range(1, N_DECILES + 1))
+                forced_cohorts = sum(len(forced_active[d]) for d in range(1, N_DECILES + 1))
                 active_holdings = sum(
-                    len(cohort.get("codes", []))
+                    int(cohort.get("n_codes", 0))
                     for d in range(1, N_DECILES + 1)
                     for cohort in active[d]
+                ) + sum(
+                    int(cohort.get("n_codes", 0))
+                    for d in range(1, N_DECILES + 1)
+                    for cohort in forced_active[d]
                 )
                 log(
                     "Portfolio progress: "
                     f"{exp_name}/{model_name}/{universe_group}, "
                     f"day={day_i:,}/{total_days:,}, date={pd.Timestamp(date).date()}, "
-                    f"active_cohorts={active_cohorts:,}, active_code_slots={active_holdings:,}"
+                    f"active_cohorts={active_cohorts:,}, forced_cohorts={forced_cohorts:,}, "
+                    f"active_code_slots={active_holdings:,}"
                 )
                 last_progress = now
             blocked_buys_by_decile = defaultdict(int)
@@ -1176,56 +1360,79 @@ def calc_overlapping_portfolios(pred, daily_context):
             for cohort in signals_by_pos.get(return_pos, []):
                 decile = cohort["decile"]
                 ideal_active[decile].append(cohort.copy())
-                buyable_codes, blocked_buys, buy_missing = filter_buyable_codes(
-                    cohort["codes"],
+                buyable_code_ids, blocked_buys, buy_missing = filter_buyable_code_ids(
+                    cohort["code_ids"],
                     daily_info,
                 )
                 blocked_buys_by_decile[decile] += blocked_buys
                 buy_missing_by_decile[decile] += buy_missing
-                if buyable_codes:
+                if len(buyable_code_ids):
                     new_cohort = cohort.copy()
-                    new_cohort["codes"] = buyable_codes
+                    new_cohort["code_ids"] = buyable_code_ids
+                    new_cohort["n_codes"] = int(len(buyable_code_ids))
                     buy_constrained_active[decile].append(new_cohort.copy())
                     active[decile].append(new_cohort)
+                    sell_due[decile][new_cohort["target_end_pos"]].append(new_cohort)
 
             for decile in range(1, N_DECILES + 1):
                 ideal_start = [
                     cohort
                     for cohort in ideal_active[decile]
-                    if cohort.get("codes")
+                    if int(cohort.get("n_codes", 0)) > 0
                 ]
                 buy_constrained_start = [
                     cohort
                     for cohort in buy_constrained_active[decile]
-                    if cohort.get("codes")
+                    if int(cohort.get("n_codes", 0)) > 0
                 ]
                 active_start = [
                     cohort
                     for cohort in active[decile]
-                    if cohort.get("codes")
+                    if int(cohort.get("n_codes", 0)) > 0
+                ]
+                forced_start = [
+                    cohort
+                    for cohort in forced_active[decile]
+                    if int(cohort.get("n_codes", 0)) > 0
                 ]
                 ideal_active[decile] = ideal_start
                 buy_constrained_active[decile] = buy_constrained_start
                 active[decile] = active_start
+                forced_active[decile] = forced_start
+                active_start = active_start + forced_start
 
                 if not active_start and not ideal_start and not buy_constrained_start:
-                    prev_weights[decile] = {}
+                    prev_weights[decile] = empty_weight_state()
                     continue
 
-                weights = make_weights_from_cohorts(active_start)
-                start_turnover = calc_weight_turnover(prev_weights[decile], weights)
+                weight_state = make_weight_state_from_cohorts(active_start)
+                start_turnover = calc_weight_turnover_states(prev_weights[decile], weight_state)
                 actual_return_info = (
-                    calc_active_cohort_return(active_start, daily_info, return_pos)
+                    calc_weighted_return_state(
+                        weight_state,
+                        daily_info,
+                        start_ids_from_cohorts(active_start, return_pos),
+                    )
                     if active_start
                     else empty_return_info(0.0)
                 )
+                ideal_weight_state = make_weight_state_from_cohorts(ideal_start)
                 ideal_return_info = (
-                    calc_active_cohort_return(ideal_start, daily_info, return_pos)
+                    calc_weighted_return_state(
+                        ideal_weight_state,
+                        daily_info,
+                        start_ids_from_cohorts(ideal_start, return_pos),
+                    )
                     if ideal_start
                     else empty_return_info(0.0)
                 )
+                buy_constrained_weight_state = make_weight_state_from_cohorts(buy_constrained_start)
                 buy_constrained_return_info = (
-                    calc_active_cohort_return(buy_constrained_start, daily_info, return_pos)
+                    calc_weighted_return_state(
+                        buy_constrained_weight_state,
+                        daily_info,
+                        start_ids_from_cohorts(buy_constrained_start, return_pos),
+                    )
                     if buy_constrained_start
                     else empty_return_info(0.0)
                 )
@@ -1241,16 +1448,29 @@ def calc_overlapping_portfolios(pred, daily_context):
                     - finite_or_zero(gross_return)
                 )
 
+                due_normal = [
+                    cohort
+                    for cohort in sell_due[decile].pop(return_pos, [])
+                    if int(cohort.get("n_codes", 0)) > 0
+                ]
+                due_ids = {id(cohort) for cohort in due_normal}
+                due_for_sell = due_normal + forced_start
                 (
-                    active_end,
+                    forced_end,
                     blocked_sells,
                     forced_holds,
                     sell_missing,
-                ) = process_sell_attempts(active_start, daily_info, return_pos)
+                ) = process_sell_attempts(due_for_sell, daily_info, return_pos)
                 ideal_end = retire_expired_cohorts(ideal_start, return_pos)
                 buy_constrained_end = retire_expired_cohorts(buy_constrained_start, return_pos)
-                end_weights = make_weights_from_cohorts(active_end)
-                end_turnover = calc_weight_turnover(weights, end_weights)
+                normal_end = [
+                    cohort
+                    for cohort in active[decile]
+                    if id(cohort) not in due_ids
+                ]
+                active_end = normal_end + forced_end
+                end_weight_state = make_weight_state_from_cohorts(active_end)
+                end_turnover = calc_weight_turnover_states(weight_state, end_weight_state)
                 turnover = start_turnover + end_turnover
                 portfolio_name = f"D{decile}"
                 data_missing = (
@@ -1273,7 +1493,7 @@ def calc_overlapping_portfolios(pred, daily_context):
                     "start_turnover": start_turnover,
                     "end_turnover": end_turnover,
                     "active_cohorts": len(active_start),
-                    "num_holdings": len(weights),
+                    "num_holdings": len(weight_state["ids"]),
                     "num_blocked_buys": blocked_buys,
                     "num_blocked_sells": blocked_sells,
                     "num_forced_holds": forced_holds,
@@ -1295,7 +1515,7 @@ def calc_overlapping_portfolios(pred, daily_context):
                     "start_turnover": start_turnover,
                     "end_turnover": end_turnover,
                     "active_cohorts": len(active_start),
-                    "num_holdings": len(weights),
+                    "num_holdings": len(weight_state["ids"]),
                     "num_blocked_buys": blocked_buys,
                     "num_blocked_sells": blocked_sells,
                     "num_forced_holds": forced_holds,
@@ -1311,14 +1531,16 @@ def calc_overlapping_portfolios(pred, daily_context):
                     "is_warmup": is_warmup,
                 })
 
-                active[decile] = active_end
+                active[decile] = normal_end
+                forced_active[decile] = forced_end
                 ideal_active[decile] = ideal_end
                 buy_constrained_active[decile] = buy_constrained_end
-                prev_weights[decile] = end_weights
+                prev_weights[decile] = end_weight_state
 
             if (
                 return_pos >= max_end_pos
                 and all(not active[d] for d in range(1, N_DECILES + 1))
+                and all(not forced_active[d] for d in range(1, N_DECILES + 1))
                 and all(not ideal_active[d] for d in range(1, N_DECILES + 1))
                 and all(not buy_constrained_active[d] for d in range(1, N_DECILES + 1))
             ):
@@ -1403,6 +1625,57 @@ def summarize_portfolios(portfolio_returns):
         })
 
     return pd.DataFrame(rows)
+
+
+def calc_portfolio_nav(portfolio_returns):
+    """
+    Build daily gross/net NAV and net drawdown curves after warmup filtering.
+    """
+    if portfolio_returns.empty:
+        return pd.DataFrame()
+
+    group_cols = GROUP_COLS + ["decile", "portfolio_name", "cost_bps"]
+    output_cols = [
+        "date",
+        "experiment_name",
+        "model_name",
+        "universe_group",
+        "portfolio_name",
+        "cost_bps",
+        "gross_nav",
+        "net_nav",
+        "drawdown",
+    ]
+    frames = []
+
+    for keys, group in portfolio_returns.groupby(group_cols, sort=True):
+        exp_name, model_name, universe_group, _decile, portfolio_name, cost_bps = keys
+        group = group.sort_values("date")
+        eval_group = group[~group["is_warmup"].astype(bool)].copy() if "is_warmup" in group.columns else group.copy()
+        eval_group = eval_group.dropna(subset=["gross_return", "net_return"])
+        if eval_group.empty:
+            continue
+
+        gross_nav = (1.0 + eval_group["gross_return"].astype(float)).cumprod()
+        net_nav = (1.0 + eval_group["net_return"].astype(float)).cumprod()
+        running_max_net_nav = net_nav.cummax()
+
+        frame = pd.DataFrame({
+            "date": eval_group["date"].to_numpy(),
+            "experiment_name": exp_name,
+            "model_name": model_name,
+            "universe_group": universe_group,
+            "portfolio_name": portfolio_name,
+            "cost_bps": cost_bps,
+            "gross_nav": gross_nav.to_numpy(),
+            "net_nav": net_nav.to_numpy(),
+            "drawdown": (net_nav / running_max_net_nav - 1.0).to_numpy(),
+        })
+        frames.append(frame[output_cols])
+
+    if not frames:
+        return pd.DataFrame(columns=output_cols)
+    return pd.concat(frames, ignore_index=True)
 
 
 def calc_return_attribution(portfolio_returns):
@@ -1518,6 +1791,7 @@ def run_one_prediction_file(path, daily_context):
     step_start = perf_counter()
     portfolio_returns, portfolio_turnover = calc_overlapping_portfolios(pred, daily_context)
     performance_summary = summarize_portfolios(portfolio_returns)
+    portfolio_nav = calc_portfolio_nav(portfolio_returns)
     return_attribution = calc_return_attribution(portfolio_returns)
     cost_sensitivity = calc_cost_sensitivity(performance_summary)
     log(
@@ -1536,6 +1810,7 @@ def run_one_prediction_file(path, daily_context):
         "decile_monotonicity": decile_monotonicity,
         "portfolio_returns": portfolio_returns,
         "portfolio_turnover": portfolio_turnover,
+        "portfolio_nav": portfolio_nav,
         "performance_summary": performance_summary,
         "return_attribution": return_attribution,
         "cost_sensitivity": cost_sensitivity,
@@ -1632,6 +1907,7 @@ def main():
         "decile_monotonicity",
         "portfolio_returns",
         "portfolio_turnover",
+        "portfolio_nav",
         "performance_summary",
         "return_attribution",
         "cost_sensitivity",

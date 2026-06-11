@@ -2,7 +2,7 @@
 
 基于 A 股日频 OHLCV 数据生成二值蜡烛图，并使用传统特征与 2D CNN 预测未来股票收益方向。项目流程参考 Jiang, Kelly and Xiu (2023) 的价格图像建模思路，并扩展为矩阵收益研究。
 
-当前版本：`v1.2.4`
+当前版本：`v1.2.5`
 
 ## 项目内容
 
@@ -20,12 +20,13 @@ V1.0 的收益与回测口径改为更接近实盘的执行假设：信号在日
 future_ret_h = close_adj[t + h] / open_adj[t + 1] - 1
 ```
 
-GitHub 仓库保存 Python 源码、`README.md`、`05_train_cnn2d.md` 和 `.gitignore`。原始数据、生成特征、图像矩阵、模型权重、预测结果和论文 PDF 不上传。
+GitHub 仓库保存 Python 源码、`README.md`、`AGENTS.md`、`05_train_cnn2d.md` 和 `.gitignore`。原始数据、生成特征、图像矩阵、模型权重、预测结果和论文 PDF 不上传。
 
 ## 文件夹结构
 
 ```text
 image_trend/
+├── AGENTS.md
 ├── config.py
 ├── 01_build_panel.py
 ├── 02_make_labels_and_baselines.py
@@ -66,9 +67,9 @@ N:\quant\A_share\daily_OHLVC\
 | `02_make_labels_and_baselines.py` | 生成未来收益标签、传统量价基线特征和可执行回测收益字段 | `data/processed/panel_by_code/code=*/part.parquet` | `data/features/features_by_code_bucket/bucket=*/part-*.parquet`；`data/features/features_by_year/year=*/part-*.parquet` | 双 Parquet dataset；按 `code bucket` 分区供 rolling/image 使用，按 `year` 分区供训练和横截面扫描使用；包含 `future_ret_{h}d`、`label_{h}d`、`ret_1d`、`open_to_close_ret_1d`、动量/反转/波动率/流动性/市值特征、`is_tradable` 和低量涨跌停交易约束字段 |
 | `03_make_images.py` | 按唯一图像窗口生成 Jiang 风格二值价格图像 shard，并把多个 horizon 标签挂到同一张图像 metadata 上 | `data/features/features_by_code_bucket/bucket=*/part-*.parquet` | `data/images/window_{window}/shard_*/images.npy`；`data/images/window_{window}/shard_*/meta.parquet` | 每个 shard 的 `.npy` 为 `uint8` 图像矩阵 `[N,H,W,1]`，像素值 `0/255`；metadata 为 Parquet，每行对应同 shard 中一张图，并包含 `label_{h}d/future_ret_{h}d` |
 | `04_train_logistic.py` | 对每个实验训练传统特征 Logistic 基线 | `data/features/features_by_year/year=*/part-*.parquet` | `outputs/predictions/pred_{experiment}_logistic.parquet` | Parquet；包含测试集 `date`、`code`、`future_ret`、`label`、`experiment_name`、`window`、`horizon`、`model_name`、`pred_prob` |
-| `05_train_cnn2d.py` | 对每个实验训练 Jiang/Kelly/Xiu 风格 2D CNN | `data/images/window_{window}/shard_*/images.npy`；`data/images/window_{window}/shard_*/meta.parquet` | `outputs/models/jiang_cnn2d_{experiment}.pt`；`outputs/predictions/pred_{experiment}_jiang_cnn2d.parquet` | `.pt` 为 PyTorch `state_dict`；同一 window 图像可供多个 horizon 实验复用，训练时按 experiment 选择对应标签列 |
-| `05_train_cnn2d_4090_fast.py` | 面向 4080/4090 的 CNN 训练脚本，增加 lazy memmap、AMP/TF32、训练诊断、AdamW、RankIC checkpoint、可选 spatial dropout 和 reslite ablation | `data/images/window_{window}/shard_*/images.npy`；`data/images/window_{window}/shard_*/meta.parquet` | `outputs/models/jiang_cnn2d_{experiment}.pt`；`outputs/predictions/pred_{experiment}_jiang_cnn2d.parquet`；`outputs/tables/cnn_training_log_{experiment}.csv` | 默认保持 Jiang baseline 输出兼容；非默认 `--arch` 会在输出文件名和 `model_name` 中标记架构 |
-| `06_backtest_decile.py` | 评估预测效果、Decile 单调性、D1-D10 long-only 组合和 D10-D1 long-short 组合 | `outputs/predictions/pred_*.parquet`；`data/features/features_by_year/year=*/part-*.parquet` | `outputs/tables/*.csv` | CSV；包含 IC、RankIC、累计 IC、Decile 未来收益、单调性、组合收益、换手、手续费敏感度、绩效汇总、有效收益覆盖率和收益磨损归因 |
+| `05_train_cnn2d.py` | 官方 CNN 训练入口，面向 4080/4090 优化，并支持论文式多 run 概率平均 | `data/images/window_{window}/shard_*/images.npy`；`data/images/window_{window}/shard_*/meta.parquet` | `outputs/models/jiang_cnn2d_{experiment}.pt` 或 `outputs/models/jiang_cnn2d_{experiment}_run*.pt`；`outputs/predictions/pred_{experiment}_jiang_cnn2d.parquet`；`outputs/tables/cnn_training_log_{experiment}*.csv`；`outputs/tables/cnn_ensemble_summary_{experiment}.csv` | 支持 lazy shard memmap、AMP/TF32、训练诊断、AdamW、RankIC checkpoint、可选 spatial dropout/reslite；默认 `--ensemble-runs 1`，使用 `--ensemble-runs 5` 时独立训练 5 次并对 `pred_prob` 做算术平均 |
+| `05_train_cnn2d_4090_fast.py` | 兼容入口，转发执行 `05_train_cnn2d.py` | 同 `05_train_cnn2d.py` | 同 `05_train_cnn2d.py` | 保留给旧集群脚本使用，不再维护第二份训练逻辑 |
+| `06_backtest_decile.py` | 评估预测效果、Decile 单调性、D1-D10 long-only 组合和 D10-D1 long-short 组合 | `outputs/predictions/pred_*.parquet`；`data/features/features_by_year/year=*/part-*.parquet` | `outputs/tables/*.csv` | CSV；包含 IC、RankIC、累计 IC、Decile 未来收益、单调性、组合收益、换手、逐日净值和回撤、手续费敏感度、绩效汇总、有效收益覆盖率和收益磨损归因 |
 
 `06_backtest_decile.py` 输出表：
 
@@ -81,10 +82,21 @@ outputs/tables/decile_summary.csv
 outputs/tables/decile_monotonicity.csv
 outputs/tables/portfolio_returns.csv
 outputs/tables/portfolio_turnover.csv
+outputs/tables/portfolio_nav.csv
 outputs/tables/performance_summary.csv
 outputs/tables/cost_sensitivity.csv
 outputs/tables/return_attribution.csv
 ```
+
+其中组合回测相关表的当前口径如下：
+
+- `portfolio_returns.csv`：逐日组合收益明细，包含 D1-D10 long-only 组合和 D10-D1 long-short 组合；保留 `gross_return/net_return`、换手、交易阻塞、强制持有、缺失收益覆盖率等诊断字段。
+- `portfolio_turnover.csv`：逐日换手明细，买入和卖出 turnover 分开记录；低量涨跌停、停牌和缺失收益导致的执行问题会计入诊断字段。
+- `portfolio_nav.csv`：逐日净值曲线，字段为 `date/experiment_name/model_name/universe_group/portfolio_name/cost_bps/gross_nav/net_nav/drawdown`；净值在剔除 warmup 期后从 1 开始复利计算，`drawdown` 使用 `net_nav` 相对历史高点计算。
+- `performance_summary.csv`：按组合汇总年化收益、年化波动率、Sharpe、最大回撤、胜率、平均换手、gross/net 累计收益和最终 NAV；累计收益和 NAV 使用复利，年化收益仍使用日均净收益乘以 252。
+- `return_attribution.csv`：按组合汇总收益磨损归因，拆分信号毛收益、买入阻塞损失、卖出阻塞强制持有损失、缺失收益数据影响和交易成本。
+
+`06_backtest_decile.py` 当前实现为了降低大样本回测开销，组合持仓内部使用整数化 `code_id`、数组化权重向量、到期卖出队列和 forced-hold 队列管理 active cohorts。该优化只改变执行效率，不改变组合收益、涨跌停/停牌处理、手续费或 warmup 统计口径。
 
 ## 推荐运行顺序
 
@@ -95,6 +107,12 @@ uv run python 03_make_images.py
 uv run python 04_train_logistic.py
 uv run python 05_train_cnn2d.py
 uv run python 06_backtest_decile.py
+```
+
+若要复现 Jiang 等论文中“同一模型配置独立训练 5 次、最终概率取算术平均”的 CNN 口径，运行：
+
+```powershell
+uv run python 05_train_cnn2d.py --ensemble-runs 5
 ```
 
 如果从 v0.1.x 升级到 v1.0，需要从 `02_make_labels_and_baselines.py` 开始重新生成下游数据，因为未来收益标签和组合回测收益字段已经改变。
@@ -111,6 +129,8 @@ uv run python 06_backtest_decile.py
 
 如果从 v1.2.3 升级到 v1.2.4，只需要重新运行 `06_backtest_decile.py`。当前回测新增 D10-D1 long-short、缺失收益覆盖率诊断、warmup 期过滤和 `return_attribution.csv` 收益归因输出，不需要重新生成面板、特征、图像或模型预测。
 
+如果从 v1.2.4 升级到 v1.2.5，不需要重新生成图像；`05_train_cnn2d_4090_fast.py` 已改为兼容入口，正式训练入口统一为 `05_train_cnn2d.py`。默认仍训练 1 次；如需论文式 ensemble，需要重新运行 `05_train_cnn2d.py --ensemble-runs 5` 生成新的 CNN 预测。由于 `06_backtest_decile.py` 新增 `portfolio_nav.csv` 并优化了组合回测执行路径，如需生成逐日净值和回撤曲线，需要重新运行 `06_backtest_decile.py`。
+
 若依赖缺失，请统一安装后再运行。当前项目约定不在脚本中自动安装依赖。
 
 ## 版本记录
@@ -119,6 +139,7 @@ uv run python 06_backtest_decile.py
 
 | 日期 | 版本 | 推送内容 | 新增功能 | 待更新功能 |
 | --- | --- | --- | --- | --- |
+| 2026-06-11 | `v1.2.5` | CNN 训练入口合并、论文式 ensemble 支持和回测净值输出 | `05_train_cnn2d.py` 合并 4090 fast 训练逻辑，成为唯一正式 CNN 训练入口；`05_train_cnn2d_4090_fast.py` 改为兼容 wrapper；新增 `--ensemble-runs`，支持每个 experiment 独立训练多次并对测试集概率做算术平均，`--ensemble-runs 5` 对应论文式 5-run 预测信号；`06_backtest_decile.py` 新增 `portfolio_nav.csv`，输出逐日 `gross_nav/net_nav/drawdown`；组合回测 hot path 改为整数化 code id、数组化权重向量、到期卖出队列和 forced-hold 队列，降低 Python dict/list 遍历开销且不改变既有回测逻辑 | 评估 5-run ensemble 的训练耗时和预测收益表现；如默认启用 5-run，需要同步调整 Slurm walltime 和模型存储策略；评估是否将大型明细输出改为 Parquet；补充分年度、行业暴露和 beta 暴露报表 |
 | 2026-06-11 | `v1.2.4` | 回测执行诊断和收益归因升级 | `06_backtest_decile.py` 缺失持仓收益改为按有效收益股票加权平均，并记录 `valid_weight/missing_weight`；`performance_summary.csv` 增加 `valid_day_ratio`、`avg_valid_weight`、`low_coverage_day_ratio`；新增 `D10_minus_D1` long-short 组合；新增 `return_attribution.csv`，拆分 `signal_gross_alpha - buy_blocked_loss - sell_blocked_forced_hold_loss - missing_return_data_issue - turnover_cost = attributed_net_return`；多周期组合权重改为独立子组合法，并在绩效统计中剔除前 `horizon` warmup 期 | 进一步数组化 active cohort 和 daily lookup；评估是否将大型明细输出改为 Parquet；补充分年度、行业暴露和 beta 暴露报表 |
 | 2026-06-02 | `v1.2.3` | 4090 CNN 训练诊断和策略升级 | 新增 `05_train_cnn2d_4090_fast.py`；支持 lazy shard memmap、writable uint8 copy、AMP/TF32、AdamW、可配置学习率/weight decay/scheduler/warmup、`fc_dropout`、默认关闭的 `spatial_dropout`、可选 `reslite` 架构、validation RankIC/decile 诊断、batch 级效率日志和 `cnn_training_log_{experiment}.csv`；移除 tqdm 依赖，改用 `--log-interval` 输出集群日志 | 根据训练日志判断是否实现 shard-aware sampler 或合并训练 shard；补充分年度、行业暴露和 beta 暴露报表 |
 | 2026-06-01 | `v1.2.2` | 图像生成去重与 fast 入口正式化 | `03_make_images.py` 采用优化后的 feature part 进程池路径，并按唯一 `window` 输出 `data/images/window_{window}`；`I20R5/I20R20`、`I60R5/I60R20` 共享物理图像，metadata 同时保存 `label_{h}d/future_ret_{h}d`；`05_train_cnn2d.py` 按 experiment horizon 选择标签列；`03_make_images_fast.py` 改为兼容入口，避免维护两份图像生成逻辑 | 增加结构化 experiment log；补充分年度、行业暴露和 beta 暴露报表 |

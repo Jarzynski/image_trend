@@ -10,12 +10,12 @@ N:\quant\A_share\image_trend\05_train_cnn2d.py
 
 ## 1. 脚本定位
 
-`05_train_cnn2d.py` 是整个图像趋势预测项目中的 CNN 训练脚本。
+`05_train_cnn2d.py` 是整个图像趋势预测项目中的官方 CNN 训练脚本。自 v1.2.5 起，原 `05_train_cnn2d_4090_fast.py` 的 4080/4090 优化训练逻辑已经合并进本文件，`05_train_cnn2d_4090_fast.py` 仅保留为兼容入口。
 
 它接收 `03_make_images.py` 生成的二值价格图像和对应 metadata，按 `config.py` 中定义的实验矩阵逐一训练 Jiang, Kelly, and Xiu (2023) 风格的 2D CNN 模型，并输出：
 
-- 每个实验的 PyTorch 模型权重；
-- 每个实验在测试集上的逐股票预测概率；
+- 每个实验的 PyTorch 模型权重；若启用 ensemble，则保存每次独立 run 的权重；
+- 每个实验在测试集上的逐股票预测概率；若启用 ensemble，则 `pred_prob` 为多次独立 run 概率的算术平均；
 - 训练、验证、测试过程中的 AUC、准确率、Brier score 和 loss 日志。
 
 当前脚本覆盖的实验来自 `config.EXPERIMENTS`：
@@ -47,7 +47,10 @@ N:\quant\A_share\image_trend\05_train_cnn2d.py
 
 05_train_cnn2d.py
     -> outputs/models/jiang_cnn2d_{experiment}.pt
+    -> outputs/models/jiang_cnn2d_{experiment}_run*.pt   # 启用 ensemble 时
     -> outputs/predictions/pred_{experiment}_jiang_cnn2d.parquet
+    -> outputs/tables/cnn_training_log_{experiment}*.csv
+    -> outputs/tables/cnn_ensemble_summary_{experiment}.csv  # 启用 ensemble 时
 
 06_backtest_decile.py
     -> outputs/tables/*.csv
@@ -1762,21 +1765,22 @@ CNN block 数：
 
 ## 11. 与论文设定的对应关系
 
-当前脚本对应 Jiang, Kelly, and Xiu (2023) 的主要设计：
+当前脚本保留 Jiang, Kelly, and Xiu (2023) 的核心图像和 CNN 结构，同时加入了面向大样本和 4080/4090 训练的工程优化：
 
 | 论文设定 | 当前脚本实现 |
 |---|---|
 | 使用价格图像预测未来收益方向 | `label` 为 0/1，模型输出 `pred_prob` |
-| 5/20/60 日图像 | `EXPERIMENTS` 中的 `window` |
+| 5/20/60 日图像尺寸 | `03_make_images.py` 生成 `[N,32,15,1]`、`[N,64,60,1]`、`[N,96,180,1]` |
 | 5/20/60 日模型使用不同深度 | `JiangCNN2D.WINDOW_CONFIG` |
 | CNN building block | `JiangCNNBlock` |
 | Conv + BN + LeakyReLU + Pool | `JiangCNNBlock.block` |
 | LeakyReLU slope = 0.01 | `nn.LeakyReLU(negative_slope=0.01)` |
-| FC 前 dropout 50% | `nn.Dropout(0.50)` |
 | Xavier 初始化 | `_init_weights` |
-| Adam, lr=1e-5 | `torch.optim.Adam(..., lr=lr)` 默认 `lr=1e-5` |
-| batch size 128 | `batch_size=128` |
-| validation early stopping | `best_valid_loss`, `patience=2` |
+| 同一模型配置独立训练 5 次并平均概率 | 使用 `--ensemble-runs 5`；最终 `pred_prob` 为 5 次 `pred_prob_run_*` 的算术平均 |
+| FC 前 dropout | 默认 `--fc-dropout 0.20`；如需旧 baseline/论文近似口径，可显式设为 `--fc-dropout 0.50` |
+| 优化器和学习率 | 默认工程配置为 `AdamW`、`lr=1e-4`、`weight_decay=3e-5`；可用 `--optimizer adam --lr 1e-5` 回到旧 baseline 风格 |
+| batch size | 默认 `--batch-size 256`；可通过 CLI 调整 |
+| validation early stopping | 默认按 validation RankIC 优先、AUC 次之、loss 兜底选择 checkpoint，并支持 `--patience`、`--min-epochs` |
 
 实现上的一个工程选择：
 
@@ -1799,6 +1803,14 @@ python 05_train_cnn2d.py
 ```powershell
 uv run python 05_train_cnn2d.py
 ```
+
+论文式 5 次独立训练并平均预测概率：
+
+```powershell
+uv run python 05_train_cnn2d.py --ensemble-runs 5
+```
+
+旧集群脚本如果仍调用 `05_train_cnn2d_4090_fast.py`，会被兼容入口转发到 `05_train_cnn2d.py`，不再维护第二份训练实现。
 
 前提：
 

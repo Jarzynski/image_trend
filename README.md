@@ -2,7 +2,7 @@
 
 基于 A 股日频 OHLCV 数据生成二值蜡烛图，并使用传统特征与 2D CNN 预测未来股票收益方向。项目流程参考 Jiang, Kelly and Xiu (2023) 的价格图像建模思路，并扩展为矩阵收益研究。
 
-当前版本：`v1.2.3`
+当前版本：`v1.2.4`
 
 ## 项目内容
 
@@ -68,7 +68,7 @@ N:\quant\A_share\daily_OHLVC\
 | `04_train_logistic.py` | 对每个实验训练传统特征 Logistic 基线 | `data/features/features_by_year/year=*/part-*.parquet` | `outputs/predictions/pred_{experiment}_logistic.parquet` | Parquet；包含测试集 `date`、`code`、`future_ret`、`label`、`experiment_name`、`window`、`horizon`、`model_name`、`pred_prob` |
 | `05_train_cnn2d.py` | 对每个实验训练 Jiang/Kelly/Xiu 风格 2D CNN | `data/images/window_{window}/shard_*/images.npy`；`data/images/window_{window}/shard_*/meta.parquet` | `outputs/models/jiang_cnn2d_{experiment}.pt`；`outputs/predictions/pred_{experiment}_jiang_cnn2d.parquet` | `.pt` 为 PyTorch `state_dict`；同一 window 图像可供多个 horizon 实验复用，训练时按 experiment 选择对应标签列 |
 | `05_train_cnn2d_4090_fast.py` | 面向 4080/4090 的 CNN 训练脚本，增加 lazy memmap、AMP/TF32、训练诊断、AdamW、RankIC checkpoint、可选 spatial dropout 和 reslite ablation | `data/images/window_{window}/shard_*/images.npy`；`data/images/window_{window}/shard_*/meta.parquet` | `outputs/models/jiang_cnn2d_{experiment}.pt`；`outputs/predictions/pred_{experiment}_jiang_cnn2d.parquet`；`outputs/tables/cnn_training_log_{experiment}.csv` | 默认保持 Jiang baseline 输出兼容；非默认 `--arch` 会在输出文件名和 `model_name` 中标记架构 |
-| `06_backtest_decile.py` | 评估预测效果、Decile 单调性和 D1-D10 long-only 重叠持仓组合 | `outputs/predictions/pred_*.parquet`；`data/features/features_by_year/year=*/part-*.parquet` | `outputs/tables/*.csv` | CSV；包含 IC、RankIC、累计 IC、Decile 未来收益、单调性、组合收益、换手、手续费敏感度和绩效汇总 |
+| `06_backtest_decile.py` | 评估预测效果、Decile 单调性、D1-D10 long-only 组合和 D10-D1 long-short 组合 | `outputs/predictions/pred_*.parquet`；`data/features/features_by_year/year=*/part-*.parquet` | `outputs/tables/*.csv` | CSV；包含 IC、RankIC、累计 IC、Decile 未来收益、单调性、组合收益、换手、手续费敏感度、绩效汇总、有效收益覆盖率和收益磨损归因 |
 
 `06_backtest_decile.py` 输出表：
 
@@ -83,6 +83,7 @@ outputs/tables/portfolio_returns.csv
 outputs/tables/portfolio_turnover.csv
 outputs/tables/performance_summary.csv
 outputs/tables/cost_sensitivity.csv
+outputs/tables/return_attribution.csv
 ```
 
 ## 推荐运行顺序
@@ -108,6 +109,8 @@ uv run python 06_backtest_decile.py
 
 如果从 v1.2.1 升级到 v1.2.2，需要重新运行 `03_make_images.py` 或兼容入口 `03_make_images_fast.py`。当前图像生成已将“图像 window”和“标签 horizon”解耦，同一个 window 图像只生成一次，多个 horizon 标签写入同一份 metadata。
 
+如果从 v1.2.3 升级到 v1.2.4，只需要重新运行 `06_backtest_decile.py`。当前回测新增 D10-D1 long-short、缺失收益覆盖率诊断、warmup 期过滤和 `return_attribution.csv` 收益归因输出，不需要重新生成面板、特征、图像或模型预测。
+
 若依赖缺失，请统一安装后再运行。当前项目约定不在脚本中自动安装依赖。
 
 ## 版本记录
@@ -116,6 +119,7 @@ uv run python 06_backtest_decile.py
 
 | 日期 | 版本 | 推送内容 | 新增功能 | 待更新功能 |
 | --- | --- | --- | --- | --- |
+| 2026-06-11 | `v1.2.4` | 回测执行诊断和收益归因升级 | `06_backtest_decile.py` 缺失持仓收益改为按有效收益股票加权平均，并记录 `valid_weight/missing_weight`；`performance_summary.csv` 增加 `valid_day_ratio`、`avg_valid_weight`、`low_coverage_day_ratio`；新增 `D10_minus_D1` long-short 组合；新增 `return_attribution.csv`，拆分 `signal_gross_alpha - buy_blocked_loss - sell_blocked_forced_hold_loss - missing_return_data_issue - turnover_cost = attributed_net_return`；多周期组合权重改为独立子组合法，并在绩效统计中剔除前 `horizon` warmup 期 | 进一步数组化 active cohort 和 daily lookup；评估是否将大型明细输出改为 Parquet；补充分年度、行业暴露和 beta 暴露报表 |
 | 2026-06-02 | `v1.2.3` | 4090 CNN 训练诊断和策略升级 | 新增 `05_train_cnn2d_4090_fast.py`；支持 lazy shard memmap、writable uint8 copy、AMP/TF32、AdamW、可配置学习率/weight decay/scheduler/warmup、`fc_dropout`、默认关闭的 `spatial_dropout`、可选 `reslite` 架构、validation RankIC/decile 诊断、batch 级效率日志和 `cnn_training_log_{experiment}.csv`；移除 tqdm 依赖，改用 `--log-interval` 输出集群日志 | 根据训练日志判断是否实现 shard-aware sampler 或合并训练 shard；补充分年度、行业暴露和 beta 暴露报表 |
 | 2026-06-01 | `v1.2.2` | 图像生成去重与 fast 入口正式化 | `03_make_images.py` 采用优化后的 feature part 进程池路径，并按唯一 `window` 输出 `data/images/window_{window}`；`I20R5/I20R20`、`I60R5/I60R20` 共享物理图像，metadata 同时保存 `label_{h}d/future_ret_{h}d`；`05_train_cnn2d.py` 按 experiment horizon 选择标签列；`03_make_images_fast.py` 改为兼容入口，避免维护两份图像生成逻辑 | 增加结构化 experiment log；补充分年度、行业暴露和 beta 暴露报表 |
 | 2026-05-27 | `v1.2.1` | 图像与特征分区 IO 优化 | `03_make_images.py` 改为每个实验输出 `shard_*/images.npy` 和 `shard_*/meta.parquet`；新增 `IMAGE_SHARD_SIZE`；`05_train_cnn2d.py` 改为跨 shard 读取 memmap，并用 `shard_id/local_index` 定位样本；`02_make_labels_and_baselines.py` 改为逐股票计算、按 `features_by_code_bucket` 和 `features_by_year` 批量写 Parquet dataset；`03/04/06` 同步改为从新 feature dataset 投影读取，降低小文件 IO、内存峰值和全量读写开销 | 增加结构化 experiment log；补充分年度、行业暴露和 beta 暴露报表 |

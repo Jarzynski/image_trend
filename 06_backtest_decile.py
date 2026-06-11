@@ -2,8 +2,8 @@
 """
 06_backtest_decile.py
 
-Evaluate model predictions with IC, decile returns, and long-only overlapping
-decile portfolios.
+Evaluate model predictions with IC, decile returns, long-only overlapping
+decile portfolios, and D10-D1 spread portfolios.
 
 Execution convention
 --------------------
@@ -29,10 +29,14 @@ outputs/tables/portfolio_returns.csv
 outputs/tables/portfolio_turnover.csv
 outputs/tables/performance_summary.csv
 outputs/tables/cost_sensitivity.csv
+outputs/tables/return_attribution.csv
 """
 
+import argparse
 from collections import defaultdict
 import glob
+from pathlib import Path
+from time import perf_counter
 
 import numpy as np
 import pandas as pd
@@ -65,7 +69,6 @@ DAILY_RETURN_REQUIRED_COLS = {
     "code",
     "ret_1d",
     "open_to_close_ret_1d",
-    "pct_chg",
     "volume",
     "is_suspended",
     "is_low_volume_limit_up",
@@ -74,9 +77,26 @@ DAILY_RETURN_REQUIRED_COLS = {
 
 RETURN_CHECK_MAX_ROWS = 10_000
 RETURN_CHECK_TOL = 1e-6
+LOW_COVERAGE_VALID_WEIGHT = 0.95
+LONG_SHORT_DECILE = 0
+LONG_SHORT_PORTFOLIO_NAME = "D10_minus_D1"
 
 GROUP_COLS = ["experiment_name", "model_name", "universe_group"]
 PERIOD_GROUP_COLS = ["date"] + GROUP_COLS
+
+ROW_RET_1D = 0
+ROW_OPEN_TO_CLOSE_RET_1D = 1
+ROW_VOLUME = 2
+ROW_IS_SUSPENDED = 3
+ROW_IS_LOW_VOLUME_LIMIT_UP = 4
+ROW_IS_LOW_VOLUME_LIMIT_DOWN = 5
+
+
+def log(message):
+    """
+    Print progress immediately in Slurm logs.
+    """
+    print(f"[06] {message}", flush=True)
 
 
 def require_columns(df, required_cols, context):
@@ -116,8 +136,8 @@ def load_prediction_file(path):
     """
     Read and validate one prediction parquet file.
     """
-    print(f"Reading predictions: {path}")
-    pred = pd.read_parquet(path)
+    log(f"Reading predictions: {path}")
+    pred = pd.read_parquet(path, columns=sorted(PRED_REQUIRED_COLS))
     require_columns(pred, PRED_REQUIRED_COLS, path)
 
     pred = pred.copy()
@@ -141,11 +161,28 @@ def load_prediction_file(path):
     return pred
 
 
-def load_daily_returns():
+def load_earliest_prediction_date(pred_files):
+    """
+    Read only prediction dates to find the earliest required trading-calendar date.
+    """
+    earliest = None
+
+    for path in pred_files:
+        dates = pd.read_parquet(path, columns=["date"])["date"]
+        one_min = pd.to_datetime(dates, errors="coerce").min()
+        if pd.isna(one_min):
+            continue
+        one_min = pd.Timestamp(one_min)
+        earliest = one_min if earliest is None else min(earliest, one_min)
+
+    return earliest
+
+
+def load_daily_returns(min_date=None):
     """
     Read daily realized returns used by overlapping portfolio evaluation.
     """
-    print(f"Reading daily returns: {FEATURE_BY_YEAR_DIR}")
+    log(f"Reading daily returns: {FEATURE_BY_YEAR_DIR}")
     files = sorted(FEATURE_BY_YEAR_DIR.glob("year=*/part-*.parquet"))
     if not files:
         raise RuntimeError(
@@ -162,10 +199,10 @@ def load_daily_returns():
         )
 
     try:
-        daily_ret = pd.read_parquet(
-            FEATURE_BY_YEAR_DIR,
-            columns=sorted(DAILY_RETURN_REQUIRED_COLS),
-        )
+        read_kwargs = {"columns": sorted(DAILY_RETURN_REQUIRED_COLS)}
+        if min_date is not None:
+            read_kwargs["filters"] = [("date", ">=", pd.Timestamp(min_date))]
+        daily_ret = pd.read_parquet(FEATURE_BY_YEAR_DIR, **read_kwargs)
     except Exception as exc:
         raise RuntimeError(
             f"{FEATURE_BY_YEAR_DIR} must include {sorted(DAILY_RETURN_REQUIRED_COLS)}. "
@@ -180,7 +217,6 @@ def load_daily_returns():
         daily_ret["open_to_close_ret_1d"],
         errors="coerce",
     )
-    daily_ret["pct_chg"] = pd.to_numeric(daily_ret["pct_chg"], errors="coerce")
     daily_ret["volume"] = pd.to_numeric(daily_ret["volume"], errors="coerce")
     for col in ["is_suspended", "is_low_volume_limit_up", "is_low_volume_limit_down"]:
         daily_ret[col] = pd.to_numeric(daily_ret[col], errors="coerce").fillna(0).astype("int8")
@@ -224,8 +260,11 @@ def calc_ic_by_period(pred):
     Calculate IC and RankIC for each date and universe group.
     """
     rows = []
+    groups = pred.groupby(PERIOD_GROUP_COLS, sort=True)
+    total_groups = groups.ngroups
+    last_progress = perf_counter()
 
-    for keys, group in pred.groupby(PERIOD_GROUP_COLS, sort=True):
+    for idx, (keys, group) in enumerate(groups, start=1):
         date, exp_name, model_name, universe_group = keys
         valid = group[["pred_prob", "future_ret"]].dropna()
 
@@ -241,6 +280,15 @@ def calc_ic_by_period(pred):
             "ic": ic,
             "rankic": rankic,
         })
+
+        now = perf_counter()
+        if idx == total_groups or idx % 500 == 0 or now - last_progress >= 60:
+            log(
+                "IC progress: "
+                f"{idx:,}/{total_groups:,} groups, "
+                f"current={exp_name}/{model_name}/{universe_group}/{pd.Timestamp(date).date()}"
+            )
+            last_progress = now
 
     return pd.DataFrame(rows)
 
@@ -328,14 +376,27 @@ def assign_deciles(pred):
     """
     pred = pred.copy()
     pred["decile"] = np.nan
+    groups = pred.groupby(PERIOD_GROUP_COLS, sort=False).groups
+    total_groups = len(groups)
+    last_progress = perf_counter()
 
-    for _, index in pred.groupby(PERIOD_GROUP_COLS, sort=False).groups.items():
+    for idx, (keys, index) in enumerate(groups.items(), start=1):
         if len(index) < N_DECILES:
             continue
 
         rank = pred.loc[index, "pred_prob"].rank(method="first")
         decile = pd.qcut(rank, N_DECILES, labels=False) + 1
         pred.loc[index, "decile"] = decile.astype(float).values
+
+        now = perf_counter()
+        if idx == total_groups or idx % 500 == 0 or now - last_progress >= 60:
+            date, exp_name, model_name, universe_group = keys
+            log(
+                "Decile assignment progress: "
+                f"{idx:,}/{total_groups:,} groups, "
+                f"current={exp_name}/{model_name}/{universe_group}/{pd.Timestamp(date).date()}"
+            )
+            last_progress = now
 
     return pred
 
@@ -433,55 +494,121 @@ def calc_decile_monotonicity(decile_summary):
     return pd.DataFrame(rows)
 
 
+def floating_lookup_dtype(series):
+    """
+    Preserve the loaded floating dtype when it supports NaN, otherwise use float64.
+    """
+    dtype = series.to_numpy().dtype
+    return dtype if np.issubdtype(dtype, np.floating) else np.dtype("float64")
+
+
 def prepare_daily_return_lookup(daily_returns):
     """
-    Build trading calendar and date -> per-stock execution/return lookups.
+    Build a dense date/code array lookup for execution and return fields.
+
+    Duplicate date/code rows retain the existing aggregation semantics:
+    returns and volume use mean, while execution flags use max.
     """
     trading_dates = pd.DatetimeIndex(sorted(daily_returns["date"].dropna().unique()))
     date_to_pos = {date: i for i, date in enumerate(trading_dates)}
+    codes = pd.Index(pd.unique(daily_returns["code"].dropna()))
+    code_to_id = {code: i for i, code in enumerate(codes)}
+    shape = (len(trading_dates), len(codes))
 
-    info_by_date = {}
+    lookup = {
+        "code_to_id": code_to_id,
+        "present": np.zeros(shape, dtype=bool),
+        "ret_1d": np.full(
+            shape,
+            np.nan,
+            dtype=floating_lookup_dtype(daily_returns["ret_1d"]),
+        ),
+        "open_to_close_ret_1d": np.full(
+            shape,
+            np.nan,
+            dtype=floating_lookup_dtype(daily_returns["open_to_close_ret_1d"]),
+        ),
+        "volume": np.full(
+            shape,
+            np.nan,
+            dtype=floating_lookup_dtype(daily_returns["volume"]),
+        ),
+        "is_suspended": np.zeros(shape, dtype=np.int8),
+        "is_low_volume_limit_up": np.zeros(shape, dtype=np.int8),
+        "is_low_volume_limit_down": np.zeros(shape, dtype=np.int8),
+    }
 
-    for date, group in daily_returns.groupby("date", sort=True):
-        info_by_date[pd.Timestamp(date)] = (
-            group
-            .groupby("code")
+    if daily_returns.duplicated(["date", "code"]).any():
+        aggregated = (
+            daily_returns
+            .groupby(["date", "code"], sort=True, as_index=False)
             .agg(
                 ret_1d=("ret_1d", "mean"),
                 open_to_close_ret_1d=("open_to_close_ret_1d", "mean"),
-                pct_chg=("pct_chg", "mean"),
                 volume=("volume", "mean"),
                 is_suspended=("is_suspended", "max"),
                 is_low_volume_limit_up=("is_low_volume_limit_up", "max"),
                 is_low_volume_limit_down=("is_low_volume_limit_down", "max"),
             )
         )
+    else:
+        aggregated = daily_returns
 
-    return trading_dates, date_to_pos, info_by_date
+    date_positions = trading_dates.get_indexer(aggregated["date"])
+    code_ids = aggregated["code"].map(code_to_id).to_numpy(dtype=np.int64)
+    lookup["present"][date_positions, code_ids] = True
+    for col in [
+        "ret_1d",
+        "open_to_close_ret_1d",
+        "volume",
+        "is_suspended",
+        "is_low_volume_limit_up",
+        "is_low_volume_limit_down",
+    ]:
+        lookup[col][date_positions, code_ids] = aggregated[col].to_numpy()
+
+    return trading_dates, date_to_pos, lookup
 
 
-def get_daily_info(info_by_date, trading_dates, return_pos):
+def get_daily_info(lookup, trading_dates, return_pos):
     if return_pos < 0 or return_pos >= len(trading_dates):
-        return pd.DataFrame()
-    return info_by_date.get(pd.Timestamp(trading_dates[return_pos]), pd.DataFrame())
+        return None
+    return lookup, return_pos
 
 
 def code_row(daily_info, code):
-    if daily_info.empty or code not in daily_info.index:
+    if daily_info is None:
         return None
-    return daily_info.loc[code]
+    lookup, date_pos = daily_info
+    code_id = lookup["code_to_id"].get(code)
+    if code_id is None or not lookup["present"][date_pos, code_id]:
+        return None
+    return (
+        lookup["ret_1d"][date_pos, code_id],
+        lookup["open_to_close_ret_1d"][date_pos, code_id],
+        lookup["volume"][date_pos, code_id],
+        lookup["is_suspended"][date_pos, code_id],
+        lookup["is_low_volume_limit_up"][date_pos, code_id],
+        lookup["is_low_volume_limit_down"][date_pos, code_id],
+    )
+
+
+def row_return_value(row, return_col):
+    if return_col == "open_to_close_ret_1d":
+        return row[ROW_OPEN_TO_CLOSE_RET_1D]
+    return row[ROW_RET_1D]
 
 
 def is_valid_buy_row(row):
     if row is None:
         return False
-    if int(row.get("is_suspended", 0)) == 1:
+    if int(row[ROW_IS_SUSPENDED]) == 1:
         return False
-    if int(row.get("is_low_volume_limit_up", 0)) == 1:
+    if int(row[ROW_IS_LOW_VOLUME_LIMIT_UP]) == 1:
         return False
-    if pd.isna(row.get("open_to_close_ret_1d", np.nan)):
+    if pd.isna(row[ROW_OPEN_TO_CLOSE_RET_1D]):
         return False
-    if pd.isna(row.get("volume", np.nan)) or float(row.get("volume", 0.0)) <= 0:
+    if pd.isna(row[ROW_VOLUME]) or float(row[ROW_VOLUME]) <= 0:
         return False
     return True
 
@@ -489,11 +616,11 @@ def is_valid_buy_row(row):
 def is_valid_sell_row(row, return_col):
     if row is None:
         return False
-    if int(row.get("is_suspended", 0)) == 1:
+    if int(row[ROW_IS_SUSPENDED]) == 1:
         return False
-    if int(row.get("is_low_volume_limit_down", 0)) == 1:
+    if int(row[ROW_IS_LOW_VOLUME_LIMIT_DOWN]) == 1:
         return False
-    if pd.isna(row.get(return_col, np.nan)):
+    if pd.isna(row_return_value(row, return_col)):
         return False
     return True
 
@@ -502,11 +629,11 @@ def get_code_return(row, return_col):
     if row is None:
         return np.nan, "missing"
 
-    ret = row.get(return_col, np.nan)
+    ret = row_return_value(row, return_col)
     if not pd.isna(ret):
         return float(ret), "valid"
 
-    if int(row.get("is_suspended", 0)) == 1:
+    if int(row[ROW_IS_SUSPENDED]) == 1:
         return 0.0, "suspended"
 
     return np.nan, "missing"
@@ -526,7 +653,7 @@ def filter_buyable_codes(codes, daily_info):
             buyable.append(code)
         else:
             blocked += 1
-            if row is None or pd.isna(row.get("open_to_close_ret_1d", np.nan)):
+            if row is None or pd.isna(row[ROW_OPEN_TO_CLOSE_RET_1D]):
                 data_missing += 1
 
     return buyable, blocked, data_missing
@@ -536,24 +663,41 @@ def unique_nonnull(values):
     """
     Keep first occurrence of each non-null code.
     """
-    return [x for x in pd.unique(pd.Series(values).dropna())]
+    result = []
+    seen = set()
+
+    for value in values:
+        if pd.isna(value) or value in seen:
+            continue
+        seen.add(value)
+        result.append(value)
+
+    return result
 
 
 def make_weights_from_cohorts(cohorts):
     """
-    Average active equal-weight cohorts into one long-only target weight vector.
+    Convert independent subportfolio cohorts into one target weight vector.
+
+    Each signal cohort uses one horizon slot. A 20-day signal therefore receives
+    1/20 total portfolio weight, split equally across stocks in that cohort.
+    Before the first horizon days have elapsed, the strategy is intentionally
+    under-invested. Forced-hold cohorts can extend realized exposure beyond the
+    target horizon and are tracked through diagnostics.
     """
     weights = defaultdict(float)
     cohorts = [cohort for cohort in cohorts if cohort.get("codes")]
     if not cohorts:
         return {}
 
-    cohort_weight = 1.0 / len(cohorts)
-
     for cohort in cohorts:
         codes = cohort["codes"]
         if not codes:
             continue
+        horizon = int(cohort.get("horizon", 0))
+        if horizon <= 0:
+            continue
+        cohort_weight = 1.0 / horizon
         stock_weight = cohort_weight / len(codes)
         for code in codes:
             weights[code] += stock_weight
@@ -569,44 +713,97 @@ def calc_weight_turnover(prev_weights, next_weights):
     return float(sum(abs(next_weights.get(code, 0.0) - prev_weights.get(code, 0.0)) for code in codes))
 
 
-def calc_cohort_return(cohort, daily_info, return_pos):
+def calc_weighted_return(weights, daily_info, return_pos, start_pos_by_code):
     """
-    Return for one equal-weight signal cohort on one holding day.
+    Weighted average return using only valid marked prices.
+
+    The returned gross return is normalized by valid_weight, so one missing stock
+    no longer turns the entire portfolio day into NaN. valid_weight and
+    missing_weight make the coverage loss explicit for performance diagnostics.
     """
-    return_col = "open_to_close_ret_1d" if return_pos == cohort["start_pos"] else "ret_1d"
-    returns = []
+    weighted_return = 0.0
+    valid_weight = 0.0
+    missing_weight = 0.0
     data_missing = 0
 
-    for code in cohort["codes"]:
+    for code, weight in weights.items():
+        return_col = "open_to_close_ret_1d" if return_pos == start_pos_by_code.get(code) else "ret_1d"
         ret, status = get_code_return(code_row(daily_info, code), return_col)
         if status == "missing":
             data_missing += 1
+            missing_weight += weight
+            continue
         if not pd.isna(ret):
-            returns.append(ret)
+            valid_weight += weight
+            weighted_return += weight * ret
 
-    if data_missing > 0 or not returns:
-        return np.nan, data_missing
+    if valid_weight <= 0:
+        return {
+            "return": np.nan,
+            "weighted_return": np.nan,
+            "valid_weight": 0.0,
+            "missing_weight": missing_weight,
+            "data_missing": data_missing,
+        }
 
-    return float(np.mean(returns)), data_missing
+    return {
+        "return": float(weighted_return / valid_weight),
+        "weighted_return": float(weighted_return),
+        "valid_weight": float(valid_weight),
+        "missing_weight": float(missing_weight),
+        "data_missing": data_missing,
+    }
+
+
+def empty_return_info(return_value=0.0):
+    """
+    Return diagnostics for an empty cash portfolio.
+    """
+    return {
+        "return": return_value,
+        "weighted_return": return_value,
+        "valid_weight": 0.0,
+        "missing_weight": 0.0,
+        "data_missing": 0,
+    }
+
+
+def start_pos_by_code_from_cohorts(cohorts):
+    """
+    Map each code to the first holding date of its active cohort.
+
+    If a code appears in multiple active cohorts, use the earliest start date
+    that still requires open-to-close handling on its first holding day.
+    """
+    out = {}
+    for cohort in cohorts:
+        start_pos = cohort["start_pos"]
+        for code in cohort.get("codes", []):
+            out[code] = min(out.get(code, start_pos), start_pos)
+    return out
 
 
 def calc_active_cohort_return(active_cohorts, daily_info, return_pos):
     """
-    Average active cohort returns into one long-only portfolio return.
+    Daily portfolio return from active cohorts.
     """
-    returns = []
-    data_missing = 0
+    weights = make_weights_from_cohorts(active_cohorts)
+    return calc_weighted_return(weights, daily_info, return_pos, start_pos_by_code_from_cohorts(active_cohorts))
 
-    for cohort in active_cohorts:
-        cohort_ret, cohort_missing = calc_cohort_return(cohort, daily_info, return_pos)
-        if not pd.isna(cohort_ret):
-            returns.append(cohort_ret)
-        data_missing += cohort_missing
 
-    if data_missing > 0 or not returns:
-        return np.nan, data_missing
+def retire_expired_cohorts(active_cohorts, return_pos):
+    """
+    Remove cohorts after their planned holding period without execution delay.
+    """
+    return [
+        cohort
+        for cohort in active_cohorts
+        if cohort.get("codes") and return_pos < cohort["target_end_pos"]
+    ]
 
-    return float(np.mean(returns)), data_missing
+
+def finite_or_zero(value):
+    return 0.0 if pd.isna(value) else float(value)
 
 
 def process_sell_attempts(active_cohorts, daily_info, return_pos):
@@ -633,7 +830,7 @@ def process_sell_attempts(active_cohorts, daily_info, return_pos):
             keep_codes.append(code)
             blocked_sells += 1
             forced_holds += 1
-            if row is None or pd.isna(row.get(return_col, np.nan)):
+            if row is None or pd.isna(row_return_value(row, return_col)):
                 data_missing += 1
 
         if keep_codes:
@@ -644,7 +841,7 @@ def process_sell_attempts(active_cohorts, daily_info, return_pos):
     return next_active, blocked_sells, forced_holds, data_missing
 
 
-def compound_return_for_row(row, trading_dates, date_to_pos, info_by_date):
+def compound_return_for_row(row, trading_dates, date_to_pos, lookup):
     """
     Rebuild one future return from daily open-to-close and close-to-close returns.
     """
@@ -660,7 +857,7 @@ def compound_return_for_row(row, trading_dates, date_to_pos, info_by_date):
 
     gross = 1.0
     for pos in range(start_pos, end_pos + 1):
-        info = get_daily_info(info_by_date, trading_dates, pos)
+        info = get_daily_info(lookup, trading_dates, pos)
         return_col = "open_to_close_ret_1d" if pos == start_pos else "ret_1d"
         ret, status = get_code_return(code_row(info, row["code"]), return_col)
         if status == "missing" or pd.isna(ret):
@@ -670,7 +867,7 @@ def compound_return_for_row(row, trading_dates, date_to_pos, info_by_date):
     return gross - 1.0
 
 
-def warn_if_compound_returns_mismatch(pred, trading_dates, date_to_pos, info_by_date):
+def warn_if_compound_returns_mismatch(pred, trading_dates, date_to_pos, lookup):
     """
     Check that configured future returns match compounded daily returns.
     """
@@ -681,19 +878,19 @@ def warn_if_compound_returns_mismatch(pred, trading_dates, date_to_pos, info_by_
     diffs = []
     checked = 0
     for row in sample.to_dict("records"):
-        rebuilt = compound_return_for_row(row, trading_dates, date_to_pos, info_by_date)
+        rebuilt = compound_return_for_row(row, trading_dates, date_to_pos, lookup)
         if pd.isna(rebuilt):
             continue
         checked += 1
         diffs.append(abs(float(row["future_ret"]) - rebuilt))
 
     if not diffs:
-        print("[Warning] Return compounding check skipped: no rows with complete daily returns.")
+        log("[Warning] Return compounding check skipped: no rows with complete daily returns.")
         return
 
     max_diff = max(diffs)
     if max_diff > RETURN_CHECK_TOL:
-        print(
+        log(
             "[Warning] Future-return compounding check exceeded tolerance: "
             f"checked={checked}, max_abs_diff={max_diff:.8g}, tol={RETURN_CHECK_TOL}"
         )
@@ -737,6 +934,7 @@ def build_signal_cohorts(group, date_to_pos, max_date_pos):
             "decile": decile,
             "start_pos": start_pos,
             "target_end_pos": end_pos,
+            "horizon": horizon,
             "codes": codes,
         })
         max_end_pos = max(max_end_pos, end_pos)
@@ -744,7 +942,174 @@ def build_signal_cohorts(group, date_to_pos, max_date_pos):
     return signals_by_pos, max_end_pos
 
 
-def calc_overlapping_portfolios(pred, daily_returns):
+def expand_portfolio_cost_rows(base):
+    """
+    Expand a base daily portfolio DataFrame across the configured cost grid.
+
+    Row-major repetition preserves the original ordering: all configured costs
+    for one base row appear before the next base row.
+    """
+    if base.empty:
+        return pd.DataFrame()
+
+    costs = np.asarray(COST_BPS_GRID)
+    expanded = base.loc[base.index.repeat(len(costs))].reset_index(drop=True)
+    expanded.insert(6, "cost_bps", np.tile(costs, len(base)))
+    net_return = (
+        expanded["gross_return"]
+        - expanded["turnover"] * (expanded["cost_bps"].astype(float) / 10_000.0)
+    )
+    expanded.insert(11, "net_return", net_return)
+    expanded["turnover_cost"] = expanded["turnover"] * (expanded["cost_bps"].astype(float) / 10_000.0)
+    expanded["missing_return_data_issue"] = (
+        expanded["signal_gross_alpha"].map(finite_or_zero)
+        - expanded["buy_blocked_loss"].map(finite_or_zero)
+        - expanded["sell_blocked_forced_hold_loss"].map(finite_or_zero)
+        - expanded["turnover_cost"].map(finite_or_zero)
+        - expanded["net_return"].map(finite_or_zero)
+    )
+    expanded["attributed_net_return"] = (
+        expanded["signal_gross_alpha"].map(finite_or_zero)
+        - expanded["buy_blocked_loss"].map(finite_or_zero)
+        - expanded["sell_blocked_forced_hold_loss"].map(finite_or_zero)
+        - expanded["missing_return_data_issue"].map(finite_or_zero)
+        - expanded["turnover_cost"].map(finite_or_zero)
+    )
+    return expanded
+
+
+def add_long_short_return_rows(portfolio_returns):
+    """
+    Add D10-D1 spread rows derived from the long-only D10 and D1 legs.
+    """
+    if portfolio_returns.empty:
+        return portfolio_returns
+
+    key_cols = ["date"] + GROUP_COLS + ["cost_bps"]
+    d10 = portfolio_returns[portfolio_returns["decile"] == N_DECILES].copy()
+    d1 = portfolio_returns[portfolio_returns["decile"] == 1].copy()
+    if d10.empty or d1.empty:
+        return portfolio_returns
+
+    merged = d10.merge(d1, on=key_cols, suffixes=("_d10", "_d1"), how="inner")
+    if merged.empty:
+        return portfolio_returns
+
+    cost_rate = merged["cost_bps"].astype(float) / 10_000.0
+    turnover = merged["turnover_d10"].fillna(0.0) + merged["turnover_d1"].fillna(0.0)
+    gross_return = merged["gross_return_d10"] - merged["gross_return_d1"]
+    turnover_cost = turnover * cost_rate
+
+    rows = pd.DataFrame({
+        "date": merged["date"],
+        "experiment_name": merged["experiment_name"],
+        "model_name": merged["model_name"],
+        "universe_group": merged["universe_group"],
+        "decile": LONG_SHORT_DECILE,
+        "portfolio_name": LONG_SHORT_PORTFOLIO_NAME,
+        "cost_bps": merged["cost_bps"],
+        "gross_return": gross_return,
+        "turnover": turnover,
+        "start_turnover": merged["start_turnover_d10"].fillna(0.0) + merged["start_turnover_d1"].fillna(0.0),
+        "end_turnover": merged["end_turnover_d10"].fillna(0.0) + merged["end_turnover_d1"].fillna(0.0),
+        "net_return": gross_return - turnover_cost,
+        "active_cohorts": merged["active_cohorts_d10"].fillna(0) + merged["active_cohorts_d1"].fillna(0),
+        "num_holdings": merged["num_holdings_d10"].fillna(0) + merged["num_holdings_d1"].fillna(0),
+        "num_blocked_buys": merged["num_blocked_buys_d10"].fillna(0) + merged["num_blocked_buys_d1"].fillna(0),
+        "num_blocked_sells": merged["num_blocked_sells_d10"].fillna(0) + merged["num_blocked_sells_d1"].fillna(0),
+        "num_forced_holds": merged["num_forced_holds_d10"].fillna(0) + merged["num_forced_holds_d1"].fillna(0),
+        "num_data_missing_returns": merged["num_data_missing_returns_d10"].fillna(0) + merged["num_data_missing_returns_d1"].fillna(0),
+        "valid_weight": np.minimum(
+            merged["valid_weight_d10"].fillna(0.0),
+            merged["valid_weight_d1"].fillna(0.0),
+        ),
+        "missing_weight": merged["missing_weight_d10"].fillna(0.0) + merged["missing_weight_d1"].fillna(0.0),
+        "signal_valid_weight": np.minimum(
+            merged["signal_valid_weight_d10"].fillna(0.0),
+            merged["signal_valid_weight_d1"].fillna(0.0),
+        ),
+        "signal_missing_weight": (
+            merged["signal_missing_weight_d10"].fillna(0.0)
+            + merged["signal_missing_weight_d1"].fillna(0.0)
+        ),
+        "signal_gross_alpha": merged["signal_gross_alpha_d10"] - merged["signal_gross_alpha_d1"],
+        "buy_constrained_gross_return": (
+            merged["buy_constrained_gross_return_d10"] - merged["buy_constrained_gross_return_d1"]
+        ),
+        "buy_blocked_loss": merged["buy_blocked_loss_d10"] - merged["buy_blocked_loss_d1"],
+        "sell_blocked_forced_hold_loss": (
+            merged["sell_blocked_forced_hold_loss_d10"]
+            - merged["sell_blocked_forced_hold_loss_d1"]
+        ),
+        "is_warmup": merged["is_warmup_d10"].fillna(False) | merged["is_warmup_d1"].fillna(False),
+        "turnover_cost": turnover_cost,
+    })
+    rows["missing_return_data_issue"] = (
+        rows["signal_gross_alpha"].map(finite_or_zero)
+        - rows["buy_blocked_loss"].map(finite_or_zero)
+        - rows["sell_blocked_forced_hold_loss"].map(finite_or_zero)
+        - rows["turnover_cost"].map(finite_or_zero)
+        - rows["net_return"].map(finite_or_zero)
+    )
+    rows["attributed_net_return"] = (
+        rows["signal_gross_alpha"].map(finite_or_zero)
+        - rows["buy_blocked_loss"].map(finite_or_zero)
+        - rows["sell_blocked_forced_hold_loss"].map(finite_or_zero)
+        - rows["missing_return_data_issue"].map(finite_or_zero)
+        - rows["turnover_cost"].map(finite_or_zero)
+    )
+
+    return pd.concat([portfolio_returns, rows], ignore_index=True)
+
+
+def add_long_short_turnover_rows(portfolio_turnover):
+    """
+    Add D10-D1 turnover diagnostics derived from both long-only legs.
+    """
+    if portfolio_turnover.empty:
+        return portfolio_turnover
+
+    key_cols = ["date"] + GROUP_COLS
+    d10 = portfolio_turnover[portfolio_turnover["decile"] == N_DECILES].copy()
+    d1 = portfolio_turnover[portfolio_turnover["decile"] == 1].copy()
+    if d10.empty or d1.empty:
+        return portfolio_turnover
+
+    merged = d10.merge(d1, on=key_cols, suffixes=("_d10", "_d1"), how="inner")
+    if merged.empty:
+        return portfolio_turnover
+
+    rows = pd.DataFrame({
+        "date": merged["date"],
+        "experiment_name": merged["experiment_name"],
+        "model_name": merged["model_name"],
+        "universe_group": merged["universe_group"],
+        "decile": LONG_SHORT_DECILE,
+        "portfolio_name": LONG_SHORT_PORTFOLIO_NAME,
+        "turnover": merged["turnover_d10"].fillna(0.0) + merged["turnover_d1"].fillna(0.0),
+        "start_turnover": merged["start_turnover_d10"].fillna(0.0) + merged["start_turnover_d1"].fillna(0.0),
+        "end_turnover": merged["end_turnover_d10"].fillna(0.0) + merged["end_turnover_d1"].fillna(0.0),
+        "active_cohorts": merged["active_cohorts_d10"].fillna(0) + merged["active_cohorts_d1"].fillna(0),
+        "num_holdings": merged["num_holdings_d10"].fillna(0) + merged["num_holdings_d1"].fillna(0),
+        "num_blocked_buys": merged["num_blocked_buys_d10"].fillna(0) + merged["num_blocked_buys_d1"].fillna(0),
+        "num_blocked_sells": merged["num_blocked_sells_d10"].fillna(0) + merged["num_blocked_sells_d1"].fillna(0),
+        "num_forced_holds": merged["num_forced_holds_d10"].fillna(0) + merged["num_forced_holds_d1"].fillna(0),
+        "num_data_missing_returns": (
+            merged["num_data_missing_returns_d10"].fillna(0)
+            + merged["num_data_missing_returns_d1"].fillna(0)
+        ),
+        "valid_weight": np.minimum(
+            merged["valid_weight_d10"].fillna(0.0),
+            merged["valid_weight_d1"].fillna(0.0),
+        ),
+        "missing_weight": merged["missing_weight_d10"].fillna(0.0) + merged["missing_weight_d1"].fillna(0.0),
+        "is_warmup": merged["is_warmup_d10"].fillna(False) | merged["is_warmup_d1"].fillna(False),
+    })
+
+    return pd.concat([portfolio_turnover, rows], ignore_index=True)
+
+
+def calc_overlapping_portfolios(pred, daily_context):
     """
     Build D1-D10 long-only daily portfolio returns with overlapping cohorts.
     """
@@ -752,63 +1117,128 @@ def calc_overlapping_portfolios(pred, daily_returns):
     if signals.empty:
         return pd.DataFrame(), pd.DataFrame()
 
-    trading_dates, date_to_pos, info_by_date = prepare_daily_return_lookup(daily_returns)
+    trading_dates, date_to_pos, lookup = daily_context
     if len(trading_dates) == 0:
         return pd.DataFrame(), pd.DataFrame()
 
-    warn_if_compound_returns_mismatch(signals, trading_dates, date_to_pos, info_by_date)
+    warn_if_compound_returns_mismatch(signals, trading_dates, date_to_pos, lookup)
 
-    portfolio_rows = []
+    base_portfolio_rows = []
     turnover_rows = []
     max_date_pos = len(trading_dates) - 1
 
     for keys, group in signals.groupby(GROUP_COLS, sort=True):
         exp_name, model_name, universe_group = keys
+        group_start = perf_counter()
+        log(
+            "Portfolio group start: "
+            f"{exp_name}/{model_name}/{universe_group}, signal_rows={len(group):,}"
+        )
         signals_by_pos, max_end_pos = build_signal_cohorts(group, date_to_pos, max_date_pos)
         if max_end_pos < 0:
+            log(
+                "Portfolio group skipped: "
+                f"{exp_name}/{model_name}/{universe_group}, no valid cohorts"
+            )
             continue
 
         min_start_pos = min(signals_by_pos)
+        total_days = max_date_pos - min_start_pos + 1
         active = {decile: [] for decile in range(1, N_DECILES + 1)}
+        ideal_active = {decile: [] for decile in range(1, N_DECILES + 1)}
+        buy_constrained_active = {decile: [] for decile in range(1, N_DECILES + 1)}
         prev_weights = {decile: {} for decile in range(1, N_DECILES + 1)}
+        group_horizon = int(group["horizon"].dropna().astype(int).max())
+        last_progress = perf_counter()
 
         for return_pos in range(min_start_pos, max_date_pos + 1):
             date = trading_dates[return_pos]
-            daily_info = get_daily_info(info_by_date, trading_dates, return_pos)
+            daily_info = get_daily_info(lookup, trading_dates, return_pos)
+            day_i = return_pos - min_start_pos + 1
+            now = perf_counter()
+            if day_i == 1 or day_i == total_days or day_i % 250 == 0 or now - last_progress >= 60:
+                active_cohorts = sum(len(active[d]) for d in range(1, N_DECILES + 1))
+                active_holdings = sum(
+                    len(cohort.get("codes", []))
+                    for d in range(1, N_DECILES + 1)
+                    for cohort in active[d]
+                )
+                log(
+                    "Portfolio progress: "
+                    f"{exp_name}/{model_name}/{universe_group}, "
+                    f"day={day_i:,}/{total_days:,}, date={pd.Timestamp(date).date()}, "
+                    f"active_cohorts={active_cohorts:,}, active_code_slots={active_holdings:,}"
+                )
+                last_progress = now
             blocked_buys_by_decile = defaultdict(int)
             buy_missing_by_decile = defaultdict(int)
 
             for cohort in signals_by_pos.get(return_pos, []):
+                decile = cohort["decile"]
+                ideal_active[decile].append(cohort.copy())
                 buyable_codes, blocked_buys, buy_missing = filter_buyable_codes(
                     cohort["codes"],
                     daily_info,
                 )
-                decile = cohort["decile"]
                 blocked_buys_by_decile[decile] += blocked_buys
                 buy_missing_by_decile[decile] += buy_missing
                 if buyable_codes:
                     new_cohort = cohort.copy()
                     new_cohort["codes"] = buyable_codes
+                    buy_constrained_active[decile].append(new_cohort.copy())
                     active[decile].append(new_cohort)
 
             for decile in range(1, N_DECILES + 1):
+                ideal_start = [
+                    cohort
+                    for cohort in ideal_active[decile]
+                    if cohort.get("codes")
+                ]
+                buy_constrained_start = [
+                    cohort
+                    for cohort in buy_constrained_active[decile]
+                    if cohort.get("codes")
+                ]
                 active_start = [
                     cohort
                     for cohort in active[decile]
                     if cohort.get("codes")
                 ]
+                ideal_active[decile] = ideal_start
+                buy_constrained_active[decile] = buy_constrained_start
                 active[decile] = active_start
 
-                if not active_start:
+                if not active_start and not ideal_start and not buy_constrained_start:
                     prev_weights[decile] = {}
                     continue
 
                 weights = make_weights_from_cohorts(active_start)
                 start_turnover = calc_weight_turnover(prev_weights[decile], weights)
-                gross_return, return_missing = calc_active_cohort_return(
-                    active_start,
-                    daily_info,
-                    return_pos,
+                actual_return_info = (
+                    calc_active_cohort_return(active_start, daily_info, return_pos)
+                    if active_start
+                    else empty_return_info(0.0)
+                )
+                ideal_return_info = (
+                    calc_active_cohort_return(ideal_start, daily_info, return_pos)
+                    if ideal_start
+                    else empty_return_info(0.0)
+                )
+                buy_constrained_return_info = (
+                    calc_active_cohort_return(buy_constrained_start, daily_info, return_pos)
+                    if buy_constrained_start
+                    else empty_return_info(0.0)
+                )
+                gross_return = actual_return_info["return"]
+                signal_gross_alpha = ideal_return_info["return"]
+                buy_constrained_return = buy_constrained_return_info["return"]
+                buy_blocked_loss = (
+                    finite_or_zero(signal_gross_alpha)
+                    - finite_or_zero(buy_constrained_return)
+                )
+                sell_blocked_forced_hold_loss = (
+                    finite_or_zero(buy_constrained_return)
+                    - finite_or_zero(gross_return)
                 )
 
                 (
@@ -817,16 +1247,20 @@ def calc_overlapping_portfolios(pred, daily_returns):
                     forced_holds,
                     sell_missing,
                 ) = process_sell_attempts(active_start, daily_info, return_pos)
+                ideal_end = retire_expired_cohorts(ideal_start, return_pos)
+                buy_constrained_end = retire_expired_cohorts(buy_constrained_start, return_pos)
                 end_weights = make_weights_from_cohorts(active_end)
                 end_turnover = calc_weight_turnover(weights, end_weights)
                 turnover = start_turnover + end_turnover
                 portfolio_name = f"D{decile}"
                 data_missing = (
-                    int(return_missing)
+                    int(actual_return_info["data_missing"])
                     + int(buy_missing_by_decile[decile])
                     + int(sell_missing)
                 )
                 blocked_buys = int(blocked_buys_by_decile[decile])
+                holding_day_index = day_i
+                is_warmup = holding_day_index < group_horizon
 
                 turnover_rows.append({
                     "date": date,
@@ -844,48 +1278,69 @@ def calc_overlapping_portfolios(pred, daily_returns):
                     "num_blocked_sells": blocked_sells,
                     "num_forced_holds": forced_holds,
                     "num_data_missing_returns": data_missing,
+                    "valid_weight": actual_return_info["valid_weight"],
+                    "missing_weight": actual_return_info["missing_weight"],
+                    "is_warmup": is_warmup,
                 })
 
-                for cost_bps in COST_BPS_GRID:
-                    cost_rate = float(cost_bps) / 10_000.0
-                    net_return = (
-                        np.nan
-                        if pd.isna(gross_return)
-                        else gross_return - turnover * cost_rate
-                    )
-                    portfolio_rows.append({
-                        "date": date,
-                        "experiment_name": exp_name,
-                        "model_name": model_name,
-                        "universe_group": universe_group,
-                        "decile": decile,
-                        "portfolio_name": portfolio_name,
-                        "cost_bps": cost_bps,
-                        "gross_return": gross_return,
-                        "turnover": turnover,
-                        "start_turnover": start_turnover,
-                        "end_turnover": end_turnover,
-                        "net_return": net_return,
-                        "active_cohorts": len(active_start),
-                        "num_holdings": len(weights),
-                        "num_blocked_buys": blocked_buys,
-                        "num_blocked_sells": blocked_sells,
-                        "num_forced_holds": forced_holds,
-                        "num_data_missing_returns": data_missing,
-                    })
+                base_portfolio_rows.append({
+                    "date": date,
+                    "experiment_name": exp_name,
+                    "model_name": model_name,
+                    "universe_group": universe_group,
+                    "decile": decile,
+                    "portfolio_name": portfolio_name,
+                    "gross_return": gross_return,
+                    "turnover": turnover,
+                    "start_turnover": start_turnover,
+                    "end_turnover": end_turnover,
+                    "active_cohorts": len(active_start),
+                    "num_holdings": len(weights),
+                    "num_blocked_buys": blocked_buys,
+                    "num_blocked_sells": blocked_sells,
+                    "num_forced_holds": forced_holds,
+                    "num_data_missing_returns": data_missing,
+                    "valid_weight": actual_return_info["valid_weight"],
+                    "missing_weight": actual_return_info["missing_weight"],
+                    "signal_valid_weight": ideal_return_info["valid_weight"],
+                    "signal_missing_weight": ideal_return_info["missing_weight"],
+                    "signal_gross_alpha": signal_gross_alpha,
+                    "buy_constrained_gross_return": buy_constrained_return,
+                    "buy_blocked_loss": buy_blocked_loss,
+                    "sell_blocked_forced_hold_loss": sell_blocked_forced_hold_loss,
+                    "is_warmup": is_warmup,
+                })
 
                 active[decile] = active_end
+                ideal_active[decile] = ideal_end
+                buy_constrained_active[decile] = buy_constrained_end
                 prev_weights[decile] = end_weights
 
-            if return_pos >= max_end_pos and all(not active[d] for d in range(1, N_DECILES + 1)):
+            if (
+                return_pos >= max_end_pos
+                and all(not active[d] for d in range(1, N_DECILES + 1))
+                and all(not ideal_active[d] for d in range(1, N_DECILES + 1))
+                and all(not buy_constrained_active[d] for d in range(1, N_DECILES + 1))
+            ):
                 break
 
-    return pd.DataFrame(portfolio_rows), pd.DataFrame(turnover_rows)
+        log(
+            "Portfolio group done: "
+            f"{exp_name}/{model_name}/{universe_group}, "
+            f"elapsed_sec={perf_counter() - group_start:.1f}"
+        )
+
+    base_portfolio = pd.DataFrame(base_portfolio_rows)
+    del base_portfolio_rows
+    portfolio_returns = expand_portfolio_cost_rows(base_portfolio)
+    portfolio_returns = add_long_short_return_rows(portfolio_returns)
+    portfolio_turnover = add_long_short_turnover_rows(pd.DataFrame(turnover_rows))
+    return portfolio_returns, portfolio_turnover
 
 
 def summarize_portfolios(portfolio_returns):
     """
-    Annualized performance for long-only decile portfolios.
+    Annualized performance for decile and D10-D1 portfolios.
     """
     rows = []
 
@@ -897,9 +1352,14 @@ def summarize_portfolios(portfolio_returns):
     for keys, group in portfolio_returns.groupby(group_cols, sort=True):
         exp_name, model_name, universe_group, decile, portfolio_name, cost_bps = keys
         group = group.sort_values("date")
+        n_total_days = len(group)
+        n_warmup_days = int(group["is_warmup"].sum()) if "is_warmup" in group.columns else 0
+        eval_group = group[~group["is_warmup"].astype(bool)].copy() if "is_warmup" in group.columns else group
+        if eval_group.empty:
+            continue
 
-        gross_ret = group["gross_return"].dropna()
-        net_ret = group["net_return"].dropna()
+        gross_ret = eval_group["gross_return"].dropna()
+        net_ret = eval_group["net_return"].dropna()
         if len(net_ret) == 0:
             continue
 
@@ -921,12 +1381,21 @@ def summarize_portfolios(portfolio_returns):
             "portfolio_name": portfolio_name,
             "cost_bps": cost_bps,
             "n_periods": len(net_ret),
+            "n_total_days": n_total_days,
+            "n_warmup_days": n_warmup_days,
             "annualized_return": ann_return,
             "annualized_volatility": ann_vol,
             "sharpe": sharpe,
             "max_drawdown": max_drawdown(net_nav),
             "win_rate": (net_ret > 0).mean(),
-            "avg_turnover": group["turnover"].mean(),
+            "avg_turnover": eval_group["turnover"].mean(),
+            "valid_day_ratio": eval_group["net_return"].notna().mean(),
+            "avg_valid_weight": eval_group["valid_weight"].mean() if "valid_weight" in eval_group.columns else np.nan,
+            "low_coverage_day_ratio": (
+                (eval_group["valid_weight"] < LOW_COVERAGE_VALID_WEIGHT).mean()
+                if "valid_weight" in eval_group.columns
+                else np.nan
+            ),
             "gross_cumulative_return": final_gross_nav - 1.0,
             "net_cumulative_return": final_net_nav - 1.0,
             "final_gross_nav": final_gross_nav,
@@ -936,9 +1405,67 @@ def summarize_portfolios(portfolio_returns):
     return pd.DataFrame(rows)
 
 
+def calc_return_attribution(portfolio_returns):
+    """
+    Summarize daily return attribution after removing the warmup period.
+    """
+    if portfolio_returns.empty:
+        return pd.DataFrame()
+
+    component_cols = [
+        "signal_gross_alpha",
+        "buy_blocked_loss",
+        "sell_blocked_forced_hold_loss",
+        "missing_return_data_issue",
+        "turnover_cost",
+        "attributed_net_return",
+        "net_return",
+    ]
+    group_cols = GROUP_COLS + ["decile", "portfolio_name", "cost_bps"]
+    rows = []
+
+    for keys, group in portfolio_returns.groupby(group_cols, sort=True):
+        exp_name, model_name, universe_group, decile, portfolio_name, cost_bps = keys
+        group = group.sort_values("date")
+        eval_group = group[~group["is_warmup"].astype(bool)].copy() if "is_warmup" in group.columns else group
+        if eval_group.empty:
+            continue
+
+        net_ret = eval_group["net_return"].dropna()
+        final_net_nav = (1.0 + net_ret).cumprod().iloc[-1] if len(net_ret) else np.nan
+        row = {
+            "experiment_name": exp_name,
+            "model_name": model_name,
+            "universe_group": universe_group,
+            "decile": decile,
+            "portfolio_name": portfolio_name,
+            "cost_bps": cost_bps,
+            "n_periods": len(net_ret),
+            "final_net_nav": final_net_nav,
+            "net_cumulative_return": final_net_nav - 1.0 if not pd.isna(final_net_nav) else np.nan,
+        }
+        for col in component_cols:
+            values = eval_group[col].dropna() if col in eval_group.columns else pd.Series(dtype=float)
+            row[f"mean_daily_{col}"] = values.mean() if len(values) else np.nan
+            row[f"annualized_{col}"] = values.mean() * TRADING_DAYS_PER_YEAR if len(values) else np.nan
+            row[f"cumulative_linear_{col}"] = values.sum() if len(values) else np.nan
+
+        row["annualized_attribution_residual"] = (
+            row["annualized_signal_gross_alpha"]
+            - row["annualized_buy_blocked_loss"]
+            - row["annualized_sell_blocked_forced_hold_loss"]
+            - row["annualized_missing_return_data_issue"]
+            - row["annualized_turnover_cost"]
+            - row["annualized_attributed_net_return"]
+        )
+        rows.append(row)
+
+    return pd.DataFrame(rows)
+
+
 def calc_cost_sensitivity(performance_summary):
     """
-    Cost sensitivity table derived from long-only portfolio summaries.
+    Cost sensitivity table derived from portfolio summaries.
     """
     if performance_summary.empty:
         return pd.DataFrame()
@@ -954,32 +1481,51 @@ def calc_cost_sensitivity(performance_summary):
         "sharpe",
         "max_drawdown",
         "avg_turnover",
+        "valid_day_ratio",
+        "avg_valid_weight",
+        "low_coverage_day_ratio",
         "gross_cumulative_return",
         "net_cumulative_return",
+        "final_gross_nav",
         "final_net_nav",
     ]
     return performance_summary[columns].copy()
 
 
-def run_one_prediction_file(path, daily_returns):
+def run_one_prediction_file(path, daily_context):
     """
     Run all evaluation layers for one prediction file.
     """
+    file_start = perf_counter()
     pred = load_prediction_file(path)
+    log(f"Prediction rows loaded: {Path(path).name}, rows={len(pred):,}")
     pred = add_universe_groups(pred)
+    log(f"Universe rows expanded: {Path(path).name}, rows={len(pred):,}")
 
+    step_start = perf_counter()
     ic_by_period = calc_ic_by_period(pred)
     ic_summary = calc_ic_summary(ic_by_period)
     cumulative_ic = calc_cumulative_ic(ic_by_period)
+    log(f"IC done: {Path(path).name}, elapsed_sec={perf_counter() - step_start:.1f}")
 
+    step_start = perf_counter()
     pred = assign_deciles(pred)
     decile_returns = calc_decile_returns(pred)
     decile_summary = calc_decile_summary(decile_returns)
     decile_monotonicity = calc_decile_monotonicity(decile_summary)
+    log(f"Decile done: {Path(path).name}, elapsed_sec={perf_counter() - step_start:.1f}")
 
-    portfolio_returns, portfolio_turnover = calc_overlapping_portfolios(pred, daily_returns)
+    step_start = perf_counter()
+    portfolio_returns, portfolio_turnover = calc_overlapping_portfolios(pred, daily_context)
     performance_summary = summarize_portfolios(portfolio_returns)
+    return_attribution = calc_return_attribution(portfolio_returns)
     cost_sensitivity = calc_cost_sensitivity(performance_summary)
+    log(
+        f"Portfolio done: {Path(path).name}, "
+        f"elapsed_sec={perf_counter() - step_start:.1f}, "
+        f"portfolio_rows={len(portfolio_returns):,}"
+    )
+    log(f"Prediction file done: {Path(path).name}, elapsed_sec={perf_counter() - file_start:.1f}")
 
     return {
         "ic_by_period": ic_by_period,
@@ -991,6 +1537,7 @@ def run_one_prediction_file(path, daily_returns):
         "portfolio_returns": portfolio_returns,
         "portfolio_turnover": portfolio_turnover,
         "performance_summary": performance_summary,
+        "return_attribution": return_attribution,
         "cost_sensitivity": cost_sensitivity,
     }
 
@@ -1011,15 +1558,70 @@ def save_table(df, filename):
     """
     out_path = TABLE_DIR / filename
     df.to_csv(out_path, index=False, encoding="utf-8-sig")
-    print(f"Saved {filename}: {out_path}")
+    log(f"Saved {filename}: {out_path}, rows={len(df):,}")
+
+
+def append_table(df, filename, initialized):
+    """
+    Append one prediction file's rows without rewriting prior completed files.
+    """
+    if df is None or df.empty:
+        return initialized
+
+    out_path = TABLE_DIR / filename
+    mode = "a" if initialized else "w"
+    encoding = "utf-8" if initialized else "utf-8-sig"
+    df.to_csv(
+        out_path,
+        mode=mode,
+        header=not initialized,
+        index=False,
+        encoding=encoding,
+    )
+    log(
+        f"{'Appended' if initialized else 'Started'} {filename}: "
+        f"{out_path}, added_rows={len(df):,}"
+    )
+    return True
+
+
+def parse_args():
+    """
+    Parse CLI options used mainly for cluster debugging and partial reruns.
+    """
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--pred-pattern",
+        default="pred_*.parquet",
+        help="Prediction parquet glob under outputs/predictions.",
+    )
+    parser.add_argument(
+        "--max-files",
+        type=int,
+        default=None,
+        help="Optional cap on the number of prediction files to process.",
+    )
+    return parser.parse_args()
 
 
 def main():
-    pred_files = sorted(glob.glob(str(PRED_DIR / "pred_*.parquet")))
+    args = parse_args()
+    pred_files = sorted(glob.glob(str(PRED_DIR / args.pred_pattern)))
+    if args.max_files is not None:
+        pred_files = pred_files[: args.max_files]
     if not pred_files:
-        raise RuntimeError(f"No prediction files found in {PRED_DIR}")
+        raise RuntimeError(f"No prediction files found in {PRED_DIR} matching {args.pred_pattern}")
 
-    daily_returns = load_daily_returns()
+    earliest_prediction_date = load_earliest_prediction_date(pred_files)
+    if earliest_prediction_date is not None:
+        log(f"Earliest prediction date: {earliest_prediction_date.date()}")
+
+    daily_returns = load_daily_returns(min_date=earliest_prediction_date)
+    log(f"Daily return rows loaded: {len(daily_returns):,}")
+    lookup_start = perf_counter()
+    daily_context = prepare_daily_return_lookup(daily_returns)
+    del daily_returns
+    log(f"Daily return lookup ready: elapsed_sec={perf_counter() - lookup_start:.1f}")
 
     output_names = [
         "ic_by_period",
@@ -1031,19 +1633,35 @@ def main():
         "portfolio_returns",
         "portfolio_turnover",
         "performance_summary",
+        "return_attribution",
         "cost_sensitivity",
     ]
-    outputs = {name: [] for name in output_names}
+    initialized_outputs = set()
+    performance_frames = []
 
-    for path in pred_files:
-        result = run_one_prediction_file(path, daily_returns)
+    for idx, path in enumerate(pred_files, start=1):
+        log(f"Start prediction file {idx}/{len(pred_files)}: {Path(path).name}")
+        result = run_one_prediction_file(path, daily_context)
+        performance_frames.append(result["performance_summary"])
+
+        log(f"Appending partial tables after {Path(path).name}")
         for name in output_names:
-            outputs[name].append(result[name])
+            filename = f"{name}.csv"
+            initialized = append_table(
+                result[name],
+                filename,
+                name in initialized_outputs,
+            )
+            if initialized:
+                initialized_outputs.add(name)
+
+        del result
 
     for name in output_names:
-        save_table(concat_frames(outputs[name]), f"{name}.csv")
+        if name not in initialized_outputs:
+            save_table(pd.DataFrame(), f"{name}.csv")
 
-    perf = concat_frames(outputs["performance_summary"])
+    perf = concat_frames(performance_frames)
     if not perf.empty:
         print("\nPerformance summary:")
         print(perf)

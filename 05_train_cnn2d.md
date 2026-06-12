@@ -1,6 +1,6 @@
 # `05_train_cnn2d.py` 说明文档
 
-本文档解释 `05_train_cnn2d.py` 的用途、输入输出、整体执行流程、模型结构、每个类/函数的职责，以及主要变量的含义。
+本文档对应当前版本的 `05_train_cnn2d.py`，说明脚本定位、输入输出、执行流程、模型结构、CLI 参数和主要函数职责。
 
 脚本位置：
 
@@ -10,13 +10,20 @@ N:\quant\A_share\image_trend\05_train_cnn2d.py
 
 ## 1. 脚本定位
 
-`05_train_cnn2d.py` 是整个图像趋势预测项目中的官方 CNN 训练脚本。自 v1.2.5 起，原 `05_train_cnn2d_4090_fast.py` 的 4080/4090 优化训练逻辑已经合并进本文件，`05_train_cnn2d_4090_fast.py` 仅保留为兼容入口。
+`05_train_cnn2d.py` 是项目里的官方 CNN 训练入口。自 v1.2.5 起，原 `05_train_cnn2d_4090_fast.py` 的 4080/4090 优化训练逻辑已经合并到本文件，`05_train_cnn2d_4090_fast.py` 只保留为兼容 wrapper。
 
-它接收 `03_make_images.py` 生成的二值价格图像和对应 metadata，按 `config.py` 中定义的实验矩阵逐一训练 Jiang, Kelly, and Xiu (2023) 风格的 2D CNN 模型，并输出：
+脚本读取 `03_make_images.py` 生成的二值价格图像 shard 和 metadata，按 `config.EXPERIMENTS` 中的实验矩阵训练 Jiang, Kelly, and Xiu (2023) 风格的 2D CNN，并输出测试集预测概率。默认每个实验训练 1 次；如需论文式“同一配置独立训练 5 次并平均概率”，使用 `--ensemble-runs 5`。
 
-- 每个实验的 PyTorch 模型权重；若启用 ensemble，则保存每次独立 run 的权重；
-- 每个实验在测试集上的逐股票预测概率；若启用 ensemble，则 `pred_prob` 为多次独立 run 概率的算术平均；
-- 训练、验证、测试过程中的 AUC、准确率、Brier score 和 loss 日志。
+当前脚本的主要工程特性：
+
+- 按 `window` 共享读取图像 metadata，`I20R5/I20R20` 和 `I60R5/I60R20` 不重复加载同一窗口数据。
+- 图像 shard 使用 `np.load(..., mmap_mode="r")` lazy 打开。
+- `Dataset` 返回 `uint8` CHW tensor，batch 到 GPU 后再转 `float32` 并除以 255。
+- 默认启用 CUDA AMP mixed precision 和 TF32。
+- 默认使用 AdamW、cosine scheduler、warmup、weight decay 和 FC dropout。
+- 支持 `jiang` 和 `reslite` 两种模型架构。
+- 支持 validation RankIC/IC/decile 诊断，并优先按 validation RankIC 保存 checkpoint。
+- 支持多 run ensemble、单独训练某个 ensemble run、以及 aggregation-only 汇总模式。
 
 当前脚本覆盖的实验来自 `config.EXPERIMENTS`：
 
@@ -47,10 +54,11 @@ N:\quant\A_share\image_trend\05_train_cnn2d.py
 
 05_train_cnn2d.py
     -> outputs/models/jiang_cnn2d_{experiment}.pt
-    -> outputs/models/jiang_cnn2d_{experiment}_run*.pt   # 启用 ensemble 时
+    -> outputs/models/jiang_cnn2d_{experiment}_run*.pt
+    -> outputs/predictions/ensemble_runs/{experiment}/run*.parquet
     -> outputs/predictions/pred_{experiment}_jiang_cnn2d.parquet
     -> outputs/tables/cnn_training_log_{experiment}*.csv
-    -> outputs/tables/cnn_ensemble_summary_{experiment}.csv  # 启用 ensemble 时
+    -> outputs/tables/cnn_ensemble_summary_{experiment}.csv
 
 06_backtest_decile.py
     -> outputs/tables/*.csv
@@ -58,14 +66,11 @@ N:\quant\A_share\image_trend\05_train_cnn2d.py
 
 ## 3. 输入文件
 
-对每个 `experiment_name`，脚本读取两类输入文件。
-
-### 3.1 图像数组
-
-路径由 `config.image_dir_for_window(window)` 生成。同一图像窗口只存一份，例如 `I20R5` 和 `I20R20` 共同读取 `window_20`。
+图像路径由 `config.image_dir_for_window(window)` 决定。当前图像按唯一 `window` 存储，而不是按 experiment 重复存储：
 
 ```text
 data/images/window_{window}/shard_*/images.npy
+data/images/window_{window}/shard_*/meta.parquet
 ```
 
 示例：
@@ -76,15 +81,9 @@ data/images/window_20/shard_00000/images.npy
 data/images/window_60/shard_00000/images.npy
 ```
 
-格式：
+### 3.1 `images.npy`
 
-- NumPy `.npy`
-- dtype: `uint8`
-- 背景像素为 `0`
-- 可见 OHLC、MA、volume 像素为 `255`
-- 维度顺序为 `NHWC`
-
-含义：
+每个 `images.npy` 是一个 `uint8` NumPy 数组，维度顺序为 `NHWC`：
 
 ```text
 [N, H, W, C]
@@ -92,109 +91,104 @@ data/images/window_60/shard_00000/images.npy
 
 | 维度 | 含义 |
 |---|---|
-| `N` | 样本数量，每个样本对应一个 `code-date` |
-| `H` | 图像高度，I5/I20/I60 分别为 32/64/96 |
+| `N` | 当前 shard 中的样本数，每个样本对应一个 `code-date` |
+| `H` | 图像高度，5/20/60 日窗口分别为 32/64/96 |
 | `W` | 图像宽度，等于 `window * 3` |
-| `C` | 通道数，当前为 1，即黑白单通道 |
+| `C` | 通道数，当前为 1 |
 
-每个 shard 内部仍是标准 `.npy` 数组，训练脚本逐个 shard 以内存映射方式打开：
+像素值为 `0/255`。脚本不会在 `Dataset.__getitem__` 中把每张图转成 float，而是在 `prepare_batch()` 中对整个 batch 执行：
 
 ```python
-images = np.load(shard_image_path, mmap_mode="r")
+x = x.float().div_(255.0)
 ```
 
-这里使用 `mmap_mode="r"`，表示以内存映射方式只读加载图像文件。好处是不会一次性把单个 shard 的完整 `.npy` 全部复制进内存；同时 shard 化避免把全部样本集中在一个超大 `.npy` 文件中，尤其对 I60 图像更重要。
+这样可以减少 CPU 端拷贝和 host-to-device 传输量。
 
-### 3.2 图像 metadata
+### 3.2 `meta.parquet`
 
-路径由 `config.image_dir_for_window(window)` 生成：
-
-```text
-data/images/window_{window}/shard_*/meta.parquet
-```
-
-示例：
-
-```text
-data/images/window_5/shard_00000/meta.parquet
-data/images/window_20/shard_00000/meta.parquet
-data/images/window_60/shard_00000/meta.parquet
-```
-
-格式：
-
-- Parquet
-- 每一行对应 `.npy` 中同位置的一张图像
-- 行顺序必须与图像数组第 0 维严格一致
+每个 metadata shard 与同目录 `images.npy` 一一对应，行数必须等于图像数组第 0 维。脚本会优先只读取训练需要的列，如果旧 shard 缺列导致读取失败，会 fallback 到读取完整 parquet。
 
 关键列：
 
 | 列名 | 含义 |
 |---|---|
-| `date` | 当前图像窗口结束日，也是预测发出日 |
+| `date` | 图像窗口结束日，也是预测发出日 |
 | `code` | 股票代码 |
 | `industry` | 行业 |
-| `window` | 图像窗口长度，例如 5、20、60 |
-| `label_{h}d` | horizon 为 `h` 的二分类标签，例如 `label_5d`、`label_20d` |
-| `future_ret_{h}d` | horizon 为 `h` 的未来收益，例如 `future_ret_5d`、`future_ret_20d` |
+| `shard_id` | 样本所在 shard 编号；缺失时由脚本按目录顺序补齐 |
+| `local_index` | 样本在 shard 内的行号；缺失时由脚本按行号补齐 |
+| `label_{h}d` | horizon 为 `h` 的二分类标签 |
+| `future_ret_{h}d` | horizon 为 `h` 的未来收益 |
 | `amount` | 当日成交额 |
 | `float_mktcap` | 流通市值 |
 | `is_low_volume_limit_up` | 低量涨停不可买标记 |
 | `is_low_volume_limit_down` | 低量跌停不可卖标记 |
-| `image_height` | 图像高度 |
-| `image_width` | 图像宽度 |
-| `price_height` | 价格区域高度 |
-| `volume_height` | 成交量区域高度 |
 
-`05_train_cnn2d.py` 读取 metadata 后，会按当前实验的 `horizon` 生成临时视图列 `future_ret` 和 `label`，用于训练和预测输出。
+对每个实验，`select_experiment_label_view()` 会按 `cfg["horizon"]` 选择 `label_{h}d` 和 `future_ret_{h}d`，生成临时列：
+
+```text
+label
+future_ret
+experiment_name
+window
+horizon
+```
 
 ## 4. 输出文件
 
 ### 4.1 模型权重
 
-路径：
+默认单 run：
 
 ```text
-outputs/models/jiang_cnn2d_{experiment_name.lower()}.pt
+outputs/models/jiang_cnn2d_{experiment}.pt
 ```
 
-示例：
+启用多 run ensemble 时：
 
 ```text
-outputs/models/jiang_cnn2d_i5r5.pt
-outputs/models/jiang_cnn2d_i20r5.pt
-outputs/models/jiang_cnn2d_i60r5.pt
-outputs/models/jiang_cnn2d_i20r20.pt
-outputs/models/jiang_cnn2d_i60r20.pt
+outputs/models/jiang_cnn2d_{experiment}_run01.pt
+outputs/models/jiang_cnn2d_{experiment}_run02.pt
+...
 ```
 
-内容：
-
-- PyTorch `state_dict`
-- 只保存模型参数，不保存 optimizer 状态
-
-保存代码：
-
-```python
-torch.save(model.state_dict(), model_path)
-```
-
-### 4.2 测试集预测文件
-
-路径：
+如果使用 `--arch reslite`，输出 stem 会带架构后缀：
 
 ```text
-outputs/predictions/pred_{experiment_name.lower()}_jiang_cnn2d.parquet
+outputs/models/jiang_cnn2d_{experiment}_reslite.pt
+outputs/models/jiang_cnn2d_{experiment}_reslite_run01.pt
 ```
 
-示例：
+模型文件内容是 PyTorch `state_dict`，不包含 optimizer 状态。
+
+### 4.2 单 run 预测中间文件
+
+每次独立 run 都会写出一份中间预测：
 
 ```text
-outputs/predictions/pred_i5r5_jiang_cnn2d.parquet
-outputs/predictions/pred_i20r5_jiang_cnn2d.parquet
-outputs/predictions/pred_i60r5_jiang_cnn2d.parquet
-outputs/predictions/pred_i20r20_jiang_cnn2d.parquet
-outputs/predictions/pred_i60r20_jiang_cnn2d.parquet
+outputs/predictions/ensemble_runs/{experiment}/run01.parquet
+```
+
+`reslite` 架构会写到：
+
+```text
+outputs/predictions/ensemble_runs/{experiment}_reslite/run01.parquet
+```
+
+单 run 文件中包含 `pred_prob_run_XX`，用于后续平均。
+
+### 4.3 最终测试集预测文件
+
+最终预测文件路径：
+
+```text
+outputs/predictions/pred_{experiment}_jiang_cnn2d.parquet
+```
+
+`reslite` 架构路径：
+
+```text
+outputs/predictions/pred_{experiment}_reslite_jiang_cnn2d.parquet
 ```
 
 关键列：
@@ -208,1600 +202,90 @@ outputs/predictions/pred_i60r20_jiang_cnn2d.parquet
 | `label` | 实际二分类标签 |
 | `amount` | 成交额 |
 | `float_mktcap` | 流通市值 |
-| `is_limit_up` | 是否涨停 |
+| `is_low_volume_limit_up` | 低量涨停不可买标记 |
+| `is_low_volume_limit_down` | 低量跌停不可卖标记 |
 | `experiment_name` | 实验名 |
 | `window` | 图像窗口 |
 | `horizon` | 预测周期 |
-| `model_name` | 当前为 `JiangCNN2D` |
-| `pred_prob` | 模型预测未来收益为正的概率 |
+| `model_name` | `JiangCNN2D`、`JiangCNN2D_reslite` 或带 `_ensN` 的 ensemble 名称 |
+| `ensemble_runs` | 汇总使用的独立 run 数量 |
+| `pred_prob_run_XX` | 第 `XX` 个独立 run 的预测概率 |
+| `pred_prob` | 最终预测概率；多 run 时为各 run 概率算术平均 |
 
-`06_backtest_decile.py` 会读取这些预测文件，并根据 `pred_prob` 做横截面十分组回测。
+`06_backtest_decile.py` 会读取这些预测文件，并按 `pred_prob` 做横截面排序和回测。
+
+### 4.4 训练日志
+
+每个实验会写出 epoch 级 CSV 日志：
+
+```text
+outputs/tables/cnn_training_log_{experiment}.csv
+outputs/tables/cnn_training_log_{experiment}_run01.csv
+```
+
+主要字段包括：
+
+- `epoch`
+- `lr`
+- `epoch_seconds`
+- `train_seconds`
+- `valid_seconds`
+- `train_samples_per_sec`
+- `valid_samples_per_sec`
+- `avg_data_wait_ms`
+- `avg_h2d_ms`
+- `avg_gpu_step_ms`
+- `train_loss`
+- `valid_loss`
+- `valid_auc`
+- `valid_acc`
+- `valid_brier`
+- `valid_rankic_mean`
+- `valid_rankic_positive_rate`
+- `valid_ic_mean`
+- `valid_decile_spearman`
+- `valid_decile_violations`
+- `checkpoint_score`
+- `checkpoint_metric`
+
+多 run ensemble 还会输出：
+
+```text
+outputs/tables/cnn_ensemble_summary_{experiment}.csv
+```
 
 ## 5. 依赖库
 
-脚本依赖以下 Python 包：
+脚本依赖：
 
 | 包 | 用途 |
 |---|---|
-| `numpy` | 读取 `.npy` 图像、数组索引、数值处理 |
-| `pandas` | 读取 parquet metadata、处理日期和预测表 |
-| `torch` | CNN 模型、Dataset、DataLoader、训练和保存权重 |
+| `numpy` | 读取 `.npy`、数组索引和数值处理 |
+| `pandas` | 读取 metadata parquet、处理日期、写预测和日志 |
+| `torch` | CNN、Dataset、DataLoader、训练、AMP 和保存权重 |
 | `scikit-learn` | 计算 AUC、accuracy、Brier score |
 | `pyarrow` 或其他 parquet engine | 被 pandas 用于读写 parquet |
 
-当前约定：不在脚本里安装依赖，依赖由环境统一管理。
+项目约定不在脚本中自动安装依赖。运行时使用当前 `uv` 环境。
 
-## 6. 导入模块解释
+## 6. 运行方式
 
-```python
-import numpy as np
-import pandas as pd
-```
-
-`numpy` 用于：
-
-- 读取 `.npy`；
-- 生成 split indices；
-- 转换 dtype；
-- 拼接评估结果；
-- 判断 label 是否只有单一类别。
-
-`pandas` 用于：
-
-- 读取 metadata parquet；
-- 日期转换；
-- 根据 test mask 构建预测输出表；
-- 写出预测 parquet。
-
-```python
-import torch
-import torch.nn as nn
-from torch.utils.data import Dataset, DataLoader
-```
-
-`torch` 用于：
-
-- 张量计算；
-- 模型训练；
-- CUDA/CPU 设备选择；
-- 保存模型权重。
-
-`torch.nn` 用于定义 CNN 层、loss 和模型结构。
-
-`Dataset` 和 `DataLoader` 用于把 `.npy` 图像和标签包装成可迭代 mini-batch。
-
-```python
-from sklearn.metrics import roc_auc_score, accuracy_score, brier_score_loss
-```
-
-这三个函数分别计算：
-
-- AUC；
-- 0.5 阈值分类准确率；
-- 概率预测校准误差 Brier score。
-
-```python
-from config import (...)
-```
-
-从 `config.py` 读取：
-
-| 名称 | 含义 |
-|---|---|
-| `PRED_DIR` | 预测结果输出目录 |
-| `MODEL_DIR` | 模型权重输出目录 |
-| `TRAIN_END` | 训练集结束日期 |
-| `VALID_START` | 验证集开始日期 |
-| `VALID_END` | 验证集结束日期 |
-| `TEST_START` | 测试集开始日期 |
-| `EXPERIMENTS` | 实验矩阵配置 |
-| `image_dir_for_window` | 根据图像窗口生成 shard 根目录 |
-
-## 7. 全流程概览
-
-脚本运行入口是：
-
-```python
-if __name__ == "__main__":
-    main()
-```
-
-`main()` 执行以下流程：
-
-1. 遍历 `config.EXPERIMENTS` 中的所有实验。
-2. 对每个实验按 `cfg["window"]` 定位共享 shard 根目录。
-3. 调用 `train_one_experiment(...)`。
-4. 在 `train_one_experiment(...)` 内部：
-   - 读取全部图像 shard；
-   - 合并全部 metadata shard；
-   - 按日期切分 train/valid/test；
-   - 构建 Dataset 和 DataLoader；
-   - 初始化 JiangCNN2D；
-   - 用训练集训练；
-   - 用验证集 early stopping；
-   - 恢复验证集 loss 最低的模型；
-   - 在测试集上预测；
-   - 保存模型权重；
-   - 保存测试集预测结果。
-
-伪代码：
-
-```text
-for exp_name, cfg in EXPERIMENTS:
-    image_shards, meta = load_image_shards(exp_name)
-
-    train_mask, valid_mask, test_mask = get_split_masks(meta)
-
-    train_loader = DataLoader(ImageDataset(... train_idx ...))
-    valid_loader = DataLoader(ImageDataset(... valid_idx ...))
-    test_loader = DataLoader(ImageDataset(... test_idx ...))
-
-    model = JiangCNN2D(window=cfg["window"], image_height=H, image_width=W)
-    optimizer = Adam(model.parameters(), lr=1e-5)
-    criterion = BCEWithLogitsLoss()
-
-    for epoch in 1..n_epochs:
-        train one epoch
-        evaluate validation loss
-        save best state if validation loss improves
-        stop if no improvement for patience epochs
-
-    restore best state
-    evaluate test set
-    save model and predictions
-```
-
-## 8. 类和函数逐项说明
-
-## 8.1 `ImageDataset`
-
-定义：
-
-```python
-class ImageDataset(Dataset):
-```
-
-用途：
-
-把图像数组、标签数组和样本索引包装成 PyTorch Dataset，供 DataLoader 按 batch 读取。
-
-为什么需要自定义 Dataset：
-
-- 图像文件可能很大，尤其是 I60；
-- 脚本使用 `np.load(..., mmap_mode="r")`，不希望提前复制 train/valid/test 三份数组；
-- Dataset 只保存 shard memmap 列表、样本定位索引和当前 split 的 indices；
-- 每次 `__getitem__` 只读取一个样本。
-
-### `ImageDataset.__init__`
-
-定义：
-
-```python
-def __init__(self, image_shards, labels, shard_ids, local_indices, indices):
-```
-
-输入变量：
-
-| 变量 | 类型 | 含义 |
-|---|---|---|
-| `image_shards` | list[memmap] | 图像 shard 列表，每个 shard 形状 `[N, H, W, C]` |
-| `labels` | NumPy array | 全量标签数组，形状 `[N]` |
-| `shard_ids` | NumPy array | 全量样本对应的 shard 编号 |
-| `local_indices` | NumPy array | 全量样本在各自 shard 内的行号 |
-| `indices` | array-like | 当前 split 使用的行号 |
-
-内部变量：
-
-```python
-self.image_shards = image_shards
-```
-
-保存图像 shard 引用。这里不复制图像。
-
-```python
-self.labels = labels.astype(np.float32)
-```
-
-把标签转成 `float32`，因为 `BCEWithLogitsLoss` 需要浮点标签。
-
-```python
-self.shard_ids = np.asarray(shard_ids, dtype=np.int64)
-self.local_indices = np.asarray(local_indices, dtype=np.int64)
-```
-
-保存每个全量样本的 shard 定位信息。
-
-```python
-self.indices = np.asarray(indices, dtype=np.int64)
-```
-
-把索引转成 `int64` NumPy 数组，保证后续可稳定索引。
-
-### `ImageDataset.__len__`
-
-定义：
-
-```python
-def __len__(self):
-    return len(self.indices)
-```
-
-返回当前 split 的样本数。
-
-例如：
-
-- train dataset 返回训练样本数；
-- valid dataset 返回验证样本数；
-- test dataset 返回测试样本数。
-
-### `ImageDataset.__getitem__`
-
-定义：
-
-```python
-def __getitem__(self, idx):
-```
-
-输入：
-
-| 变量 | 含义 |
-|---|---|
-| `idx` | DataLoader 传入的局部索引，范围是 `[0, len(indices)-1]` |
-
-关键步骤：
-
-```python
-real_idx = self.indices[idx]
-```
-
-把 split 内部索引转换成全量 metadata 中的真实行号。
-
-```python
-shard_id = self.shard_ids[real_idx]
-local_idx = self.local_indices[real_idx]
-x = self.image_shards[shard_id][local_idx].astype(np.float32)
-```
-
-定位到具体 shard，读取单张图像，并转为 `float32`。
-
-注意：当前图像像素是 `0/255`。这里没有除以 255，因此模型看到的是 `0` 或 `255`。这贴近论文中 “0 or 255 for black or white pixels” 的表述。
-
-```python
-x = np.ascontiguousarray(np.transpose(x, (2, 0, 1)))
-```
-
-把图像从 NumPy/图像常用的 `NHWC` 单样本形状：
-
-```text
-[H, W, C]
-```
-
-转成 PyTorch 卷积层要求的：
-
-```text
-[C, H, W]
-```
-
-`np.ascontiguousarray` 用于确保内存连续，避免 `torch.from_numpy` 在非连续数组上出现性能或兼容问题。
-
-```python
-y = self.labels[real_idx]
-```
-
-读取对应标签。
-
-```python
-return torch.from_numpy(x), torch.tensor(y)
-```
-
-返回：
-
-- 图像张量，形状 `[1, H, W]`；
-- 标签张量，标量。
-
-## 8.2 `JiangCNNBlock`
-
-定义：
-
-```python
-class JiangCNNBlock(nn.Module):
-```
-
-用途：
-
-表示 Jiang et al. CNN 的一个 building block。
-
-结构：
-
-```text
-Conv2d -> BatchNorm2d -> LeakyReLU -> MaxPool2d
-```
-
-### `JiangCNNBlock.__init__`
-
-定义：
-
-```python
-def __init__(self, in_channels, out_channels, stride=(1, 1), dilation=(1, 1)):
-```
-
-输入变量：
-
-| 变量 | 含义 |
-|---|---|
-| `in_channels` | 输入通道数 |
-| `out_channels` | 输出通道数，也就是卷积 filter 数量 |
-| `stride` | 卷积步长，格式 `(vertical_stride, horizontal_stride)` |
-| `dilation` | 卷积 dilation，格式 `(vertical_dilation, horizontal_dilation)` |
-
-局部变量：
-
-```python
-kernel_size = (5, 3)
-```
-
-卷积核大小为 `5 x 3`。这是根据论文 Appendix 的 baseline model 设置。
-
-```python
-padding = (
-    ((kernel_size[0] - 1) * dilation[0]) // 2,
-    ((kernel_size[1] - 1) * dilation[1]) // 2,
-)
-```
-
-计算 padding，使卷积在 stride 为 1 时尽量保持空间尺寸。考虑 dilation 后，实际感受野会变大，因此 padding 也需要随 dilation 调整。
-
-`self.block`：
-
-```python
-self.block = nn.Sequential(...)
-```
-
-把若干层按顺序组合。
-
-#### `nn.Conv2d`
-
-```python
-nn.Conv2d(
-    in_channels,
-    out_channels,
-    kernel_size=kernel_size,
-    stride=stride,
-    dilation=dilation,
-    padding=padding,
-)
-```
-
-作用：
-
-- 在图像上滑动卷积核；
-- 学习局部价格形态；
-- 把输入通道映射到更多输出通道。
-
-参数解释：
-
-| 参数 | 含义 |
-|---|---|
-| `in_channels` | 输入图像或上一层 feature map 的通道数 |
-| `out_channels` | 当前层卷积核数量 |
-| `kernel_size=(5,3)` | 每个卷积核覆盖 5 个 vertical pixels 和 3 个 horizontal pixels |
-| `stride` | 每次卷积窗口移动步长 |
-| `dilation` | 扩张卷积间距 |
-| `padding` | 边界补零 |
-
-#### `nn.BatchNorm2d`
-
-```python
-nn.BatchNorm2d(out_channels)
-```
-
-作用：
-
-- 对卷积输出做 batch normalization；
-- 稳定训练；
-- 减少 covariate shift；
-- 对应论文中卷积和激活之间的 batch normalization。
-
-#### `nn.LeakyReLU`
-
-```python
-nn.LeakyReLU(negative_slope=0.01)
-```
-
-作用：
-
-- 引入非线性；
-- 负半轴保留 `0.01 * x`，避免普通 ReLU 的 dead neuron 问题；
-- 对应论文中 Leaky ReLU 的设定。
-
-#### `nn.MaxPool2d`
-
-```python
-nn.MaxPool2d(kernel_size=(2, 1), stride=(2, 1), ceil_mode=True)
-```
-
-作用：
-
-- 在 vertical 方向下采样；
-- horizontal 方向不下采样；
-- 保留时间宽度上的细粒度结构。
-
-参数解释：
-
-| 参数 | 含义 |
-|---|---|
-| `kernel_size=(2,1)` | 每次 pooling 覆盖 2 行、1 列 |
-| `stride=(2,1)` | vertical 方向步长为 2，horizontal 方向步长为 1 |
-| `ceil_mode=True` | 当尺寸不能整除时向上取整，贴近论文图示中的输出尺寸 |
-
-### `JiangCNNBlock.forward`
-
-定义：
-
-```python
-def forward(self, x):
-    return self.block(x)
-```
-
-输入：
-
-- `x`: PyTorch tensor，形状 `[B, C, H, W]`
-
-输出：
-
-- 经过 block 后的 feature map。
-
-## 8.3 `JiangCNN2D`
-
-定义：
-
-```python
-class JiangCNN2D(nn.Module):
-```
-
-用途：
-
-根据输入窗口 `window` 自动构造 5/20/60 日图像对应的 CNN。
-
-这是脚本的核心模型类。
-
-### `JiangCNN2D.WINDOW_CONFIG`
-
-定义：
-
-```python
-WINDOW_CONFIG = {
-    5: {"num_blocks": 2, "first_stride_v": 1, "first_dilation_v": 1},
-    20: {"num_blocks": 3, "first_stride_v": 3, "first_dilation_v": 2},
-    60: {"num_blocks": 4, "first_stride_v": 3, "first_dilation_v": 3},
-}
-```
-
-含义：
-
-| window | blocks | 第一层 vertical stride | 第一层 vertical dilation |
-|---:|---:|---:|---:|
-| 5 | 2 | 1 | 1 |
-| 20 | 3 | 3 | 2 |
-| 60 | 4 | 3 | 3 |
-
-对应论文设定：
-
-- 5 日图像模型较浅；
-- 20 日图像模型中等；
-- 60 日图像模型更深；
-- 第一层针对较长窗口使用更粗的 vertical stride 和更大的 vertical dilation。
-
-### `JiangCNN2D.__init__`
-
-定义：
-
-```python
-def __init__(self, window, image_height, image_width, in_channels=1):
-```
-
-输入变量：
-
-| 变量 | 含义 |
-|---|---|
-| `window` | 图像窗口长度，必须是 5、20 或 60 |
-| `image_height` | 图像高度 |
-| `image_width` | 图像宽度 |
-| `in_channels` | 输入通道数，当前默认为 1 |
-
-#### window 检查
-
-```python
-if window not in self.WINDOW_CONFIG:
-    raise ValueError(f"Unsupported CNN image window: {window}")
-```
-
-作用：
-
-- 防止配置中出现模型不支持的窗口；
-- 当前仅支持 5、20、60。
-
-#### 读取当前 window 配置
-
-```python
-cfg = self.WINDOW_CONFIG[window]
-```
-
-`cfg` 包含：
-
-- `num_blocks`
-- `first_stride_v`
-- `first_dilation_v`
-
-#### 构造通道数
-
-```python
-channels = [64 * (2 ** i) for i in range(cfg["num_blocks"])]
-```
-
-生成每个 block 的输出通道数。
-
-例子：
-
-| window | `num_blocks` | `channels` |
-|---:|---:|---|
-| 5 | 2 | `[64, 128]` |
-| 20 | 3 | `[64, 128, 256]` |
-| 60 | 4 | `[64, 128, 256, 512]` |
-
-#### 逐层构建 block
-
-```python
-prev_channels = in_channels
-for i, out_channels in enumerate(channels):
-```
-
-`prev_channels` 表示当前 block 的输入通道数。
-
-第一层：
-
-```python
-if i == 0:
-    stride = (cfg["first_stride_v"], 1)
-    dilation = (cfg["first_dilation_v"], 1)
-```
-
-只有第一层使用论文指定的 vertical stride 和 dilation。
-
-后续层：
-
-```python
-else:
-    stride = (1, 1)
-    dilation = (1, 1)
-```
-
-后续层使用普通卷积。
-
-添加 block：
-
-```python
-blocks.append(
-    JiangCNNBlock(
-        in_channels=prev_channels,
-        out_channels=out_channels,
-        stride=stride,
-        dilation=dilation,
-    )
-)
-```
-
-更新下一层输入通道：
-
-```python
-prev_channels = out_channels
-```
-
-#### 组合 feature extractor
-
-```python
-self.features = nn.Sequential(*blocks)
-```
-
-`self.features` 是所有 CNN block 的顺序组合。
-
-#### 自动计算 FC 输入维度
-
-```python
-with torch.no_grad():
-    dummy = torch.zeros(1, in_channels, image_height, image_width)
-    feature_dim = self.features(dummy).flatten(1).shape[1]
-```
-
-作用：
-
-- 用一张虚拟空图像跑一遍 CNN；
-- 自动得到 flatten 后的维度；
-- 避免手工计算不同窗口下的 FC 输入长度。
-
-变量解释：
-
-| 变量 | 含义 |
-|---|---|
-| `dummy` | 形状 `[1, C, H, W]` 的全零张量 |
-| `feature_dim` | CNN 输出 flatten 后的特征长度 |
-
-#### 分类器
-
-```python
-self.classifier = nn.Sequential(
-    nn.Flatten(),
-    nn.Dropout(0.50),
-    nn.Linear(feature_dim, 1),
-)
-```
-
-结构：
-
-1. `Flatten`: 把 CNN feature map 展平成向量；
-2. `Dropout(0.50)`: 随机丢弃 50% 特征，降低过拟合；
-3. `Linear(feature_dim, 1)`: 输出一个 logit。
-
-为什么输出 1 个 logit：
-
-- 当前任务是二分类；
-- `BCEWithLogitsLoss` 接收一个 logit；
-- `torch.sigmoid(logit)` 得到正类概率；
-- 等价于二分类 softmax 的正类概率，但实现更简洁。
-
-#### Xavier 初始化
-
-```python
-self.apply(self._init_weights)
-```
-
-对模型中的卷积层和线性层应用 Xavier 初始化。
-
-### `JiangCNN2D._init_weights`
-
-定义：
-
-```python
-@staticmethod
-def _init_weights(module):
-```
-
-作用：
-
-初始化权重。
-
-逻辑：
-
-```python
-if isinstance(module, (nn.Conv2d, nn.Linear)):
-    nn.init.xavier_uniform_(module.weight)
-    if module.bias is not None:
-        nn.init.zeros_(module.bias)
-```
-
-含义：
-
-- 对 `Conv2d` 和 `Linear` 的权重使用 Xavier uniform；
-- bias 初始化为 0；
-- 对 BatchNorm 等层不做额外处理，使用 PyTorch 默认初始化。
-
-### `JiangCNN2D.forward`
-
-定义：
-
-```python
-def forward(self, x):
-    x = self.features(x)
-    logit = self.classifier(x).squeeze(-1)
-    return logit
-```
-
-输入：
-
-- `x`: 形状 `[B, 1, H, W]`
-
-输出：
-
-- `logit`: 形状 `[B]`
-
-执行流程：
-
-1. `self.features(x)` 提取图像特征；
-2. `self.classifier(x)` 输出 `[B, 1]`；
-3. `.squeeze(-1)` 转为 `[B]`；
-4. 返回 logits。
-
-注意：
-
-- `forward` 不做 sigmoid；
-- 训练 loss 使用 raw logits；
-- 评估时再用 `torch.sigmoid(logit)` 转概率。
-
-## 8.4 `get_device`
-
-定义：
-
-```python
-def get_device():
-    return torch.device("cuda" if torch.cuda.is_available() else "cpu")
-```
-
-用途：
-
-自动选择训练设备。
-
-返回：
-
-| 条件 | 返回 |
-|---|---|
-| CUDA 可用 | `cuda` |
-| CUDA 不可用 | `cpu` |
-
-影响：
-
-- 模型会被 `.to(device)` 移动到该设备；
-- mini-batch 中的 `x` 和 `y` 也会被 `.to(device)`；
-- 如果是 CUDA，会启用 `pin_memory=True`。
-
-## 8.5 `get_split_masks`
-
-定义：
-
-```python
-def get_split_masks(meta):
-```
-
-用途：
-
-根据 `config.py` 中的日期边界，把样本切成训练集、验证集、测试集。
-
-输入：
-
-| 变量 | 含义 |
-|---|---|
-| `meta` | 当前实验的 metadata DataFrame |
-
-关键代码：
-
-```python
-date = pd.to_datetime(meta["date"])
-```
-
-确保 `date` 是 pandas datetime 类型。
-
-```python
-train_mask = date <= TRAIN_END
-```
-
-训练集：
-
-```text
-date <= TRAIN_END
-```
-
-```python
-valid_mask = (date >= VALID_START) & (date <= VALID_END)
-```
-
-验证集：
-
-```text
-VALID_START <= date <= VALID_END
-```
-
-```python
-test_mask = date >= TEST_START
-```
-
-测试集：
-
-```text
-date >= TEST_START
-```
-
-返回：
-
-```python
-return train_mask.values, valid_mask.values, test_mask.values
-```
-
-返回三个 NumPy boolean arrays。
-
-当前配置来自 `config.py`：
-
-| 名称 | 当前值 |
-|---|---|
-| `TRAIN_END` | `2019-12-31` |
-| `VALID_START` | `2020-01-01` |
-| `VALID_END` | `2020-12-31` |
-| `TEST_START` | `2021-01-01` |
-
-## 8.6 `evaluate_model`
-
-定义：
-
-```python
-def evaluate_model(model, loader, device, criterion):
-```
-
-用途：
-
-在验证集或测试集上评估模型。
-
-输入变量：
-
-| 变量 | 含义 |
-|---|---|
-| `model` | 已训练或正在训练的 PyTorch 模型 |
-| `loader` | valid_loader 或 test_loader |
-| `device` | `cuda` 或 `cpu` |
-| `criterion` | loss 函数，当前为 `BCEWithLogitsLoss` |
-
-内部变量：
-
-```python
-probs = []
-labels = []
-total_loss = 0.0
-n_obs = 0
-```
-
-| 变量 | 含义 |
-|---|---|
-| `probs` | 存放每个 batch 的预测概率 |
-| `labels` | 存放每个 batch 的真实标签 |
-| `total_loss` | loss 总和，按样本数加权 |
-| `n_obs` | 已评估样本数 |
-
-关键步骤：
-
-```python
-model.eval()
-```
-
-切换到评估模式：
-
-- Dropout 停止随机丢弃；
-- BatchNorm 使用评估模式统计。
-
-```python
-with torch.no_grad():
-```
-
-关闭梯度计算，节省显存和计算。
-
-batch 循环：
-
-```python
-for x, y in loader:
-    x = x.to(device)
-    y = y.to(device)
-    logit = model(x)
-    loss = criterion(logit, y)
-    prob = torch.sigmoid(logit).cpu().numpy()
-```
-
-含义：
-
-1. 把数据移动到设备；
-2. 前向传播得到 logit；
-3. 计算 loss；
-4. 用 sigmoid 得到正类概率。
-
-收集结果：
-
-```python
-probs.append(prob)
-labels.append(y.cpu().numpy())
-total_loss += loss.item() * len(y)
-n_obs += len(y)
-```
-
-最后拼接：
-
-```python
-probs = np.concatenate(probs)
-labels = np.concatenate(labels)
-```
-
-指标计算：
-
-```python
-if len(np.unique(labels)) < 2:
-    auc = np.nan
-else:
-    auc = roc_auc_score(labels, probs)
-```
-
-如果标签只有一个类别，AUC 无法定义，返回 `nan`。
-
-```python
-acc = accuracy_score(labels, probs > 0.5)
-```
-
-以 0.5 为阈值计算分类准确率。
-
-```python
-brier = brier_score_loss(labels, probs)
-```
-
-计算 Brier score，衡量概率预测误差。
-
-```python
-avg_loss = total_loss / max(n_obs, 1)
-```
-
-计算平均 loss。
-
-返回：
-
-```python
-return probs, labels, auc, acc, brier, avg_loss
-```
-
-| 返回值 | 含义 |
-|---|---|
-| `probs` | 正类预测概率 |
-| `labels` | 真实标签 |
-| `auc` | ROC AUC |
-| `acc` | accuracy |
-| `brier` | Brier score |
-| `avg_loss` | 平均 BCE loss |
-
-## 8.7 `train_one_experiment`
-
-定义：
-
-```python
-def train_one_experiment(exp_name, cfg, n_epochs=50, batch_size=128, lr=1e-5):
-```
-
-用途：
-
-训练单个实验的 CNN 模型。
-
-这是脚本中最重要的流程函数。
-
-输入变量：
-
-| 变量 | 默认值 | 含义 |
-|---|---:|---|
-| `exp_name` | 无 | 实验名，例如 `I20R5` |
-| `cfg` | 无 | 当前实验在 `EXPERIMENTS` 中的配置 |
-| `n_epochs` | `50` | 最大训练 epoch 数 |
-| `batch_size` | `128` | mini-batch 样本数 |
-| `lr` | `1e-5` | Adam 初始学习率 |
-
-### 8.7.1 加载图像 shard 和 metadata
-
-```python
-print(f"Loading image shards: {image_dir_for_window(cfg['window'])}")
-image_shards, meta = load_image_shards(exp_name, cfg)
-meta = select_experiment_label_view(meta, exp_name, cfg)
-image_height, image_width = image_shards[0].shape[1], image_shards[0].shape[2]
-```
-
-变量解释：
-
-| 变量 | 含义 |
-|---|---|
-| `image_shards` | 多个 shard 的图像 memmap 列表 |
-| `meta` | 合并后的 metadata 表，并已按当前 experiment 的 horizon 选择 `label/future_ret` |
-| `image_height` | 图像高度 |
-| `image_width` | 图像宽度 |
-
-这里不复制图像数据，适合大样本。每个样本通过 `shard_id` 和 `local_index` 定位到具体 shard 内的位置。
-
-### 8.7.2 提取标签与 shard 索引
-
-```python
-labels = meta["label"].values.astype(np.float32)
-shard_ids = meta["shard_id"].values.astype(np.int64)
-local_indices = meta["local_index"].values.astype(np.int64)
-```
-
-`labels` 是长度为 `N` 的 NumPy 数组。
-
-值域：
-
-- `1.0`: 未来收益为正；
-- `0.0`: 未来收益不为正。
-
-### 8.7.4 生成时间切分 mask
-
-```python
-train_mask, valid_mask, test_mask = get_split_masks(meta)
-```
-
-得到三个 boolean arrays。
-
-### 8.7.5 mask 转 indices
-
-```python
-train_idx = np.flatnonzero(train_mask)
-valid_idx = np.flatnonzero(valid_mask)
-test_idx = np.flatnonzero(test_mask)
-```
-
-变量解释：
-
-| 变量 | 含义 |
-|---|---|
-| `train_idx` | 训练集样本在全量数组中的行号 |
-| `valid_idx` | 验证集样本在全量数组中的行号 |
-| `test_idx` | 测试集样本在全量数组中的行号 |
-
-为什么用 indices：
-
-- 避免 `images[train_mask]` 这种复制大数组的操作；
-- Dataset 每次只根据 index 读取需要的样本。
-
-### 8.7.6 检查 split 是否为空
-
-```python
-if len(train_idx) == 0 or len(valid_idx) == 0 or len(test_idx) == 0:
-    raise RuntimeError(...)
-```
-
-如果任意 split 为空，训练没有意义，直接报错。
-
-常见原因：
-
-- 数据日期范围没有覆盖 train/valid/test；
-- 过滤条件过严；
-- 某个 experiment 样本不足。
-
-### 8.7.7 选择设备
-
-```python
-device = get_device()
-pin_memory = device.type == "cuda"
-```
-
-变量解释：
-
-| 变量 | 含义 |
-|---|---|
-| `device` | 训练设备 |
-| `pin_memory` | CUDA 下启用 pinned memory，加快 CPU 到 GPU 的数据传输 |
-
-### 8.7.8 构造 DataLoader
-
-训练集：
-
-```python
-train_loader = DataLoader(
-    ImageDataset(image_shards, labels, shard_ids, local_indices, train_idx),
-    batch_size=batch_size,
-    shuffle=True,
-    num_workers=0,
-    pin_memory=pin_memory,
-)
-```
-
-验证集：
-
-```python
-valid_loader = DataLoader(
-    ImageDataset(image_shards, labels, shard_ids, local_indices, valid_idx),
-    batch_size=batch_size,
-    shuffle=False,
-    num_workers=0,
-    pin_memory=pin_memory,
-)
-```
-
-测试集：
-
-```python
-test_loader = DataLoader(
-    ImageDataset(image_shards, labels, shard_ids, local_indices, test_idx),
-    batch_size=batch_size,
-    shuffle=False,
-    num_workers=0,
-    pin_memory=pin_memory,
-)
-```
-
-参数解释：
-
-| 参数 | 含义 |
-|---|---|
-| `batch_size` | 每个 batch 的样本数 |
-| `shuffle=True` | 训练集打乱顺序 |
-| `shuffle=False` | 验证/测试保持顺序 |
-| `num_workers=0` | 不开多进程读取，Windows 下更稳定 |
-| `pin_memory` | CUDA 时加速数据传输 |
-
-### 8.7.9 初始化模型
-
-```python
-model = JiangCNN2D(
-    window=cfg["window"],
-    image_height=image_height,
-    image_width=image_width,
-).to(device)
-```
-
-变量解释：
-
-| 变量 | 含义 |
-|---|---|
-| `cfg["window"]` | 决定模型使用 2/3/4 个 CNN blocks |
-| `image_height` | 决定 FC 输入维度 |
-| `image_width` | 决定 FC 输入维度 |
-
-`.to(device)` 把模型移动到 GPU 或 CPU。
-
-### 8.7.10 optimizer 和 loss
-
-```python
-optimizer = torch.optim.Adam(model.parameters(), lr=lr)
-criterion = nn.BCEWithLogitsLoss()
-```
-
-`optimizer`：
-
-- 使用 Adam；
-- 默认学习率 `1e-5`；
-- 更新模型参数。
-
-`criterion`：
-
-- 二分类交叉熵；
-- 输入为 raw logit；
-- 内部包含 sigmoid 的数值稳定形式。
-
-### 8.7.11 early stopping 变量
-
-```python
-best_valid_loss = np.inf
-best_state = None
-patience = 2
-bad_epochs = 0
-```
-
-变量解释：
-
-| 变量 | 含义 |
-|---|---|
-| `best_valid_loss` | 当前最好的验证集 loss |
-| `best_state` | 验证 loss 最低时的模型权重 |
-| `patience` | 允许验证 loss 连续不改善的 epoch 数 |
-| `bad_epochs` | 当前连续不改善次数 |
-
-当前规则：
-
-- 如果验证 loss 下降，保存模型；
-- 如果连续 2 个 epoch 没有下降，提前停止。
-
-### 8.7.12 训练循环
-
-```python
-for epoch in range(1, n_epochs + 1):
-```
-
-最多训练 `n_epochs` 轮。
-
-每轮开始：
-
-```python
-model.train()
-total_loss = 0.0
-n_obs = 0
-```
-
-`model.train()` 启用训练模式：
-
-- Dropout 生效；
-- BatchNorm 使用当前 batch 统计。
-
-batch 训练：
-
-```python
-for x, y in train_loader:
-    x = x.to(device)
-    y = y.to(device)
-
-    optimizer.zero_grad()
-    logit = model(x)
-    loss = criterion(logit, y)
-    loss.backward()
-    optimizer.step()
-
-    total_loss += loss.item() * len(y)
-    n_obs += len(y)
-```
-
-逐步解释：
-
-| 步骤 | 含义 |
-|---|---|
-| `x.to(device)` | 图像移动到 GPU/CPU |
-| `y.to(device)` | 标签移动到 GPU/CPU |
-| `optimizer.zero_grad()` | 清空上一 batch 梯度 |
-| `model(x)` | 前向传播 |
-| `criterion(logit, y)` | 计算 BCE loss |
-| `loss.backward()` | 反向传播 |
-| `optimizer.step()` | 参数更新 |
-| `total_loss += ...` | 累积训练 loss |
-| `n_obs += ...` | 累积样本数 |
-
-训练集平均 loss：
-
-```python
-train_loss = total_loss / max(n_obs, 1)
-```
-
-### 8.7.13 验证集评估
-
-```python
-valid_prob, valid_y, valid_auc, valid_acc, valid_brier, valid_loss = evaluate_model(
-    model, valid_loader, device, criterion
-)
-```
-
-得到：
-
-| 变量 | 含义 |
-|---|---|
-| `valid_prob` | 验证集预测概率 |
-| `valid_y` | 验证集真实标签 |
-| `valid_auc` | 验证集 AUC |
-| `valid_acc` | 验证集 accuracy |
-| `valid_brier` | 验证集 Brier score |
-| `valid_loss` | 验证集平均 loss |
-
-日志输出：
-
-```python
-print(
-    f"Epoch {epoch:03d} | "
-    f"loss={train_loss:.5f} | "
-    f"valid loss={valid_loss:.5f} | "
-    f"valid AUC={valid_auc:.4f} | "
-    f"valid ACC={valid_acc:.4f} | "
-    f"valid Brier={valid_brier:.4f}"
-)
-```
-
-### 8.7.14 保存最佳模型
-
-```python
-if valid_loss < best_valid_loss:
-    best_valid_loss = valid_loss
-    best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
-    bad_epochs = 0
-else:
-    bad_epochs += 1
-```
-
-如果验证 loss 改善：
-
-- 更新 `best_valid_loss`；
-- 保存当前模型参数到 CPU；
-- 重置 `bad_epochs`。
-
-如果没有改善：
-
-- `bad_epochs += 1`。
-
-为什么保存到 CPU：
-
-- 避免占用额外 GPU 显存；
-- 后续恢复时再 `.to(device)`。
-
-### 8.7.15 early stopping
-
-```python
-if bad_epochs >= patience:
-    print("Early stopping triggered.")
-    break
-```
-
-如果验证 loss 连续 `patience` 个 epoch 没有下降，提前停止训练。
-
-### 8.7.16 恢复最佳模型
-
-```python
-if best_state is None:
-    raise RuntimeError(f"{exp_name} did not produce a valid checkpoint.")
-
-model.load_state_dict(best_state)
-model = model.to(device)
-```
-
-如果训练过程中从未保存过模型，报错。
-
-否则，恢复验证集 loss 最低的权重。
-
-### 8.7.17 测试集评估
-
-```python
-test_prob, test_y, test_auc, test_acc, test_brier, test_loss = evaluate_model(
-    model, test_loader, device, criterion
-)
-```
-
-得到测试集指标。
-
-日志：
-
-```python
-print(
-    f"{exp_name} TEST | "
-    f"loss={test_loss:.5f} | "
-    f"AUC={test_auc:.4f} | ACC={test_acc:.4f} | Brier={test_brier:.4f}"
-)
-```
-
-### 8.7.18 保存模型权重
-
-```python
-model_path = MODEL_DIR / f"jiang_cnn2d_{exp_name.lower()}.pt"
-torch.save(model.state_dict(), model_path)
-```
-
-输出文件：
-
-```text
-outputs/models/jiang_cnn2d_{experiment}.pt
-```
-
-### 8.7.19 保存测试集预测结果
-
-选取测试集 metadata：
-
-```python
-pred = meta.loc[test_mask, [
-    "date", "code", "industry",
-    "future_ret", "label",
-    "amount", "float_mktcap", "is_limit_up",
-]].copy()
-```
-
-新增模型信息：
-
-```python
-pred["experiment_name"] = exp_name
-```
-
-如果 metadata 有 `window`：
-
-```python
-pred["window"] = meta.loc[test_mask, "window"].values
-```
-
-如果 metadata 有 `horizon`：
-
-```python
-pred["horizon"] = meta.loc[test_mask, "horizon"].values
-```
-
-模型名：
-
-```python
-pred["model_name"] = "JiangCNN2D"
-```
-
-预测概率：
-
-```python
-pred["pred_prob"] = test_prob
-```
-
-保存路径：
-
-```python
-out_path = PRED_DIR / f"pred_{exp_name.lower()}_jiang_cnn2d.parquet"
-pred.to_parquet(out_path, index=False)
-```
-
-## 8.8 `main`
-
-定义：
-
-```python
-def main():
-    for exp_name, cfg in EXPERIMENTS.items():
-        train_one_experiment(exp_name, cfg)
-```
-
-用途：
-
-遍历所有实验并逐个训练。
-
-变量解释：
-
-| 变量 | 含义 |
-|---|---|
-| `exp_name` | 实验名，例如 `I60R20` |
-| `cfg` | 当前实验配置 |
-| `image_dir_for_window(cfg["window"])` | 当前实验对应 window 的共享 shard 根目录 |
-
-当前执行顺序由 `config.EXPERIMENTS` 的字典顺序决定。
-
-## 9. 关键变量总表
-
-## 9.1 数据相关变量
-
-| 变量 | 位置 | 含义 |
-|---|---|---|
-| `image_shards` | `train_one_experiment` | 多个 shard 图像数组 memmap 列表 |
-| `shard_ids` | `train_one_experiment` | 每行样本所在 shard 的编号 |
-| `local_indices` | `train_one_experiment` | 每行样本在 shard 内的行号 |
-| `image_height` | `train_one_experiment` | 图像高度 |
-| `image_width` | `train_one_experiment` | 图像宽度 |
-| `meta` | `train_one_experiment` | metadata DataFrame |
-| `labels` | `train_one_experiment` | 二分类标签数组 |
-| `train_mask` | `train_one_experiment` | 训练集 boolean mask |
-| `valid_mask` | `train_one_experiment` | 验证集 boolean mask |
-| `test_mask` | `train_one_experiment` | 测试集 boolean mask |
-| `train_idx` | `train_one_experiment` | 训练集整数行号 |
-| `valid_idx` | `train_one_experiment` | 验证集整数行号 |
-| `test_idx` | `train_one_experiment` | 测试集整数行号 |
-
-## 9.2 DataLoader 相关变量
-
-| 变量 | 含义 |
-|---|---|
-| `train_loader` | 训练集 mini-batch 迭代器 |
-| `valid_loader` | 验证集 mini-batch 迭代器 |
-| `test_loader` | 测试集 mini-batch 迭代器 |
-| `batch_size` | 每个 mini-batch 的样本数 |
-| `pin_memory` | CUDA 下是否启用 pinned memory |
-| `num_workers` | DataLoader 子进程数量，当前为 0 |
-
-## 9.3 模型相关变量
-
-| 变量 | 含义 |
-|---|---|
-| `model` | `JiangCNN2D` 实例 |
-| `window` | 图像窗口长度，决定 CNN 深度 |
-| `in_channels` | 输入通道数，当前为 1 |
-| `channels` | 每个 CNN block 的输出通道数 |
-| `prev_channels` | 当前 block 的输入通道数 |
-| `out_channels` | 当前 block 的输出通道数 |
-| `stride` | 当前卷积层 stride |
-| `dilation` | 当前卷积层 dilation |
-| `kernel_size` | 卷积核大小，当前为 `(5,3)` |
-| `padding` | 卷积 padding |
-| `feature_dim` | CNN 输出 flatten 后的维度 |
-| `self.features` | CNN blocks |
-| `self.classifier` | Flatten + Dropout + Linear |
-
-## 9.4 训练相关变量
-
-| 变量 | 含义 |
-|---|---|
-| `n_epochs` | 最大训练轮数 |
-| `lr` | 学习率 |
-| `optimizer` | Adam optimizer |
-| `criterion` | BCEWithLogitsLoss |
-| `epoch` | 当前 epoch |
-| `x` | 当前 batch 图像 |
-| `y` | 当前 batch 标签 |
-| `logit` | 模型 raw output |
-| `loss` | 当前 batch loss |
-| `total_loss` | 当前 epoch 累积 loss |
-| `n_obs` | 当前 epoch 累积样本数 |
-| `train_loss` | 当前 epoch 平均训练 loss |
-
-## 9.5 early stopping 变量
-
-| 变量 | 含义 |
-|---|---|
-| `best_valid_loss` | 历史最低验证 loss |
-| `best_state` | 历史最佳模型参数 |
-| `patience` | 连续不改善容忍轮数 |
-| `bad_epochs` | 当前连续不改善轮数 |
-
-## 9.6 评估相关变量
-
-| 变量 | 含义 |
-|---|---|
-| `probs` | 预测概率 |
-| `labels` | 真实标签 |
-| `auc` | ROC AUC |
-| `acc` | Accuracy |
-| `brier` | Brier score |
-| `avg_loss` | 平均 loss |
-| `valid_prob` | 验证集预测概率 |
-| `valid_y` | 验证集真实标签 |
-| `valid_auc` | 验证集 AUC |
-| `valid_acc` | 验证集 accuracy |
-| `valid_brier` | 验证集 Brier score |
-| `valid_loss` | 验证集 loss |
-| `test_prob` | 测试集预测概率 |
-| `test_y` | 测试集真实标签 |
-| `test_auc` | 测试集 AUC |
-| `test_acc` | 测试集 accuracy |
-| `test_brier` | 测试集 Brier score |
-| `test_loss` | 测试集 loss |
-
-## 9.7 输出相关变量
-
-| 变量 | 含义 |
-|---|---|
-| `model_path` | 模型权重保存路径 |
-| `pred` | 测试集预测结果 DataFrame |
-| `out_path` | 预测 parquet 保存路径 |
-| `pred_prob` | 未来收益为正的预测概率 |
-
-## 10. 模型结构尺寸解释
-
-当前图像结构来自 `config.py`：
-
-| window | image height | image width | channels |
-|---:|---:|---:|---:|
-| 5 | 32 | 15 | 1 |
-| 20 | 64 | 60 | 1 |
-| 60 | 96 | 180 | 1 |
-
-CNN block 数：
-
-| window | blocks | channels |
-|---:|---:|---|
-| 5 | 2 | 64, 128 |
-| 20 | 3 | 64, 128, 256 |
-| 60 | 4 | 64, 128, 256, 512 |
-
-第一层特殊设置：
-
-| window | first vertical stride | first vertical dilation |
-|---:|---:|---:|
-| 5 | 1 | 1 |
-| 20 | 3 | 2 |
-| 60 | 3 | 3 |
-
-后续层：
-
-| 参数 | 值 |
-|---|---|
-| stride | `(1,1)` |
-| dilation | `(1,1)` |
-| kernel | `(5,3)` |
-| pooling | `(2,1)` |
-
-## 11. 与论文设定的对应关系
-
-当前脚本保留 Jiang, Kelly, and Xiu (2023) 的核心图像和 CNN 结构，同时加入了面向大样本和 4080/4090 训练的工程优化：
-
-| 论文设定 | 当前脚本实现 |
-|---|---|
-| 使用价格图像预测未来收益方向 | `label` 为 0/1，模型输出 `pred_prob` |
-| 5/20/60 日图像尺寸 | `03_make_images.py` 生成 `[N,32,15,1]`、`[N,64,60,1]`、`[N,96,180,1]` |
-| 5/20/60 日模型使用不同深度 | `JiangCNN2D.WINDOW_CONFIG` |
-| CNN building block | `JiangCNNBlock` |
-| Conv + BN + LeakyReLU + Pool | `JiangCNNBlock.block` |
-| LeakyReLU slope = 0.01 | `nn.LeakyReLU(negative_slope=0.01)` |
-| Xavier 初始化 | `_init_weights` |
-| 同一模型配置独立训练 5 次并平均概率 | 使用 `--ensemble-runs 5`；最终 `pred_prob` 为 5 次 `pred_prob_run_*` 的算术平均 |
-| FC 前 dropout | 默认 `--fc-dropout 0.20`；如需旧 baseline/论文近似口径，可显式设为 `--fc-dropout 0.50` |
-| 优化器和学习率 | 默认工程配置为 `AdamW`、`lr=1e-4`、`weight_decay=3e-5`；可用 `--optimizer adam --lr 1e-5` 回到旧 baseline 风格 |
-| batch size | 默认 `--batch-size 256`；可通过 CLI 调整 |
-| validation early stopping | 默认按 validation RankIC 优先、AUC 次之、loss 兜底选择 checkpoint，并支持 `--patience`、`--min-epochs` |
-
-实现上的一个工程选择：
-
-- 论文描述最终 softmax 输出 up/down 两类概率；
-- 当前脚本使用单 logit + `BCEWithLogitsLoss`；
-- 评估时用 `sigmoid(logit)` 得到 up 概率；
-- 对二分类任务，这与二分类 softmax 在预测概率意义上等价；
-- 好处是输出文件天然只有一列 `pred_prob`，和回测脚本兼容。
-
-## 12. 运行方式
-
-在依赖和上游数据都已准备好后，可在项目目录运行：
-
-```powershell
-python 05_train_cnn2d.py
-```
-
-如果你使用 uv 管理环境，运行命令由你的环境设置决定，例如：
+在 `image_trend` 目录下运行：
 
 ```powershell
 uv run python 05_train_cnn2d.py
+```
+
+只训练指定实验：
+
+```powershell
+uv run python 05_train_cnn2d.py --experiments I20R5
+```
+
+只训练指定窗口对应的实验：
+
+```powershell
+uv run python 05_train_cnn2d.py --windows 20
 ```
 
 论文式 5 次独立训练并平均预测概率：
@@ -1810,66 +294,457 @@ uv run python 05_train_cnn2d.py
 uv run python 05_train_cnn2d.py --ensemble-runs 5
 ```
 
-旧集群脚本如果仍调用 `05_train_cnn2d_4090_fast.py`，会被兼容入口转发到 `05_train_cnn2d.py`，不再维护第二份训练实现。
+在 Slurm array 或手工拆分任务时，只训练其中一个 run：
 
-前提：
+```powershell
+uv run python 05_train_cnn2d.py --experiments I20R5 --ensemble-runs 5 --ensemble-run-id 3
+```
 
-1. 已运行 `03_make_images.py`；
-2. `data/images/window_{window}/shard_*/` 下已有所需窗口的 `images.npy` 和 `meta.parquet`；
-3. Python 环境中已有 `numpy/pandas/pyarrow/torch/scikit-learn`；
-4. GPU 环境可用时，PyTorch 能正确识别 CUDA。
+所有 run 完成后，只做概率平均、不重新训练：
 
-## 13. 常见问题
+```powershell
+uv run python 05_train_cnn2d.py --experiments I20R5 --ensemble-runs 5 --ensemble-aggregate-only
+```
 
-## 13.1 报错：找不到图像文件
+快速 smoke test 示例：
 
-可能原因：
+```powershell
+uv run python 05_train_cnn2d.py --experiments I5R5 --epochs 1 --max-valid-batches 2 --max-test-batches 2
+```
+
+## 7. CLI 参数
+
+| 参数 | 默认值 | 含义 |
+|---|---:|---|
+| `--experiments` | `None` | 逗号分隔实验名，例如 `I5R5,I20R5` |
+| `--windows` | `None` | 逗号分隔窗口，例如 `5,20` |
+| `--epochs` | `50` | 最大训练 epoch |
+| `--batch-size` | `256` | batch size |
+| `--lr` | `1e-4` | 基础学习率 |
+| `--workers` | `default_num_workers()` | DataLoader worker 数，默认 2 到 4 之间 |
+| `--prefetch-factor` | `2` | 每个 worker 预取 batch 数 |
+| `--patience` | `8` | early stopping 容忍轮数 |
+| `--min-epochs` | `8` | early stopping 生效前最少训练轮数 |
+| `--min-delta` | `1e-4` | checkpoint score 最小改善幅度 |
+| `--optimizer` | `adamw` | `adamw` 或 `adam` |
+| `--weight-decay` | `3e-5` | AdamW/Adam weight decay |
+| `--scheduler` | `cosine` | `none`、`cosine` 或 `plateau` |
+| `--warmup-epochs` | `1` | warmup epoch 数 |
+| `--fc-dropout` | `0.20` | 分类头 dropout |
+| `--spatial-dropout` | `0.0` | CNN feature map dropout，0 表示关闭 |
+| `--arch` | `jiang` | `jiang` 或 `reslite` |
+| `--ensemble-runs` | `1` | 每个实验独立训练次数 |
+| `--ensemble-run-id` | `None` | 只训练第几个 ensemble member，1-based |
+| `--ensemble-aggregate-only` | `False` | 只读取 run parquet 并写最终平均预测 |
+| `--valid-metric-interval` | `1` | 每多少个 epoch 跑一次完整验证 |
+| `--max-valid-batches` | `None` | 验证 batch 上限，主要用于 smoke test |
+| `--max-test-batches` | `None` | 测试 batch 上限，主要用于 smoke test |
+| `--no-amp` | `False` | 关闭 CUDA AMP |
+| `--no-tf32` | `False` | 关闭 TF32 |
+| `--compile` | `False` | 使用 `torch.compile` |
+| `--channels-last` | `False` | CUDA 下使用 channels_last memory format |
+| `--no-pin-memory` | `False` | 关闭 DataLoader pin_memory |
+| `--no-persistent-workers` | `False` | 关闭 persistent workers |
+| `--drop-last-train` | `False` | 丢弃训练集最后一个不完整 batch |
+| `--log-interval` | `200` | 训练 batch 级日志间隔 |
+| `--profile-batches` | `0` | 对每个 epoch 前 N 个 batch 做同步计时，0 表示关闭 |
+| `--shard-cache-size` | `32` | 每个 DataLoader worker 最多缓存的 shard memmap 数 |
+
+## 8. 全流程概览
+
+入口是：
+
+```python
+if __name__ == "__main__":
+    main()
+```
+
+`main()` 的流程：
+
+1. 解析 CLI 参数。
+2. 通过 `selected_experiments()` 和 `group_experiments_by_window()` 选出实验并按 `window` 分组。
+3. 如果指定 `--ensemble-aggregate-only`，直接读取 run parquet 并调用 `aggregate_ensemble_predictions()` 写最终预测。
+4. 调用 `configure_torch()` 设置随机种子、cuDNN benchmark、TF32。
+5. 对每个 `window` 调用 `load_image_window()` 读取 shard 路径和合并 metadata。
+6. 对该窗口下的每个实验调用 `fit_one_experiment()`。
+7. `fit_one_experiment()` 根据 `--ensemble-runs` 决定训练一个或多个独立 run。
+8. 每个 run 调用 `fit_one_experiment_run()` 完成训练、验证、测试、保存模型和 run 预测。
+9. 如果不是单独 run 模式，调用 `aggregate_ensemble_predictions()` 生成最终预测文件。
+10. 释放当前 window 的对象和 CUDA cache，再进入下一个 window。
+
+简化伪代码：
+
+```text
+experiments = selected_experiments(args.experiments, args.windows)
+grouped = group_experiments_by_window(experiments)
+
+if ensemble_aggregate_only:
+    for exp_name, cfg in experiments:
+        aggregate_ensemble_predictions(exp_name, cfg, options)
+    return
+
+configure_torch(RANDOM_SEED)
+
+for window in grouped:
+    image_paths, meta_window, image_shape = load_image_window(window)
+
+    for exp_name, cfg in grouped[window]:
+        for run_id in selected run ids:
+            pred_run = fit_one_experiment_run(...)
+            save_run_prediction(...)
+
+        aggregate_ensemble_predictions(...)
+```
+
+## 9. 数据读取和切分
+
+### 9.1 `load_image_window`
+
+`load_image_window(window, window_experiments)` 会：
+
+- 定位 `data/images/window_{window}/shard_*`；
+- 检查每个 shard 是否同时包含 `images.npy` 和 `meta.parquet`；
+- 用 `np.load(..., mmap_mode="r")` 读取 shape 后立即关闭 memmap；
+- 检查同一 window 下所有 shard 的 trailing shape 一致；
+- 读取 metadata；
+- 补齐缺失的 `shard_id/local_index`；
+- 检查 metadata 行数与图像数一致；
+- 压缩 metadata dtype；
+- 返回 `image_paths`、`meta_window`、`image_shape`。
+
+注意：主进程这里只保存 `images.npy` 路径，不长期持有所有 shard memmap。真正的图像 memmap 由 `ImageDataset` 在 DataLoader worker 内 lazy 打开。
+
+### 9.2 `compress_meta_dtypes`
+
+该函数降低大样本 metadata 的内存占用：
+
+- `date` 转为 datetime；
+- `code/industry/experiment_name` 转为 category；
+- `shard_id/local_index/window/horizon` 转为 `int32`；
+- `label_*` 和 `future_ret_*` 转为 `float32`；
+- `amount/float_mktcap` 转为 `float32`；
+- 低量涨跌停标记转为 `int8`。
+
+### 9.3 `get_split_indices`
+
+`get_split_indices(meta, horizon)` 按日期生成 train/valid/test 行号。
+
+训练集：
+
+```text
+date <= TRAIN_END
+date < VALID_START - embargo_gap
+```
+
+验证集：
+
+```text
+VALID_START <= date <= VALID_END
+date < TEST_START - embargo_gap
+```
+
+测试集：
+
+```text
+date >= TEST_START
+```
+
+其中 `embargo_gap` 来自 `config.EMBARGO_DAYS_BY_HORIZON`。这样可以减少不同样本未来收益窗口重叠导致的泄漏风险。
+
+## 10. Dataset 和 DataLoader
+
+## 10.1 `ImageDataset`
+
+`ImageDataset` 保存：
+
+| 属性 | 含义 |
+|---|---|
+| `image_paths` | 每个 shard 的 `images.npy` 路径 |
+| `labels` | 全量标签数组，`float32` |
+| `shard_ids` | 每行样本所在 shard |
+| `local_indices` | 每行样本在 shard 内的位置 |
+| `indices` | 当前 split 使用的全量行号 |
+| `shard_cache_size` | 每个 Dataset 实例最多打开的 shard memmap 数 |
+| `_shard_cache` | LRU shard memmap cache |
+
+`__getitem__()` 的关键流程：
+
+1. 用 split 内部 `idx` 找到全量 `real_idx`。
+2. 根据 `shard_id/local_index` 定位图片。
+3. 如果 shard 不在 cache 中，用 `np.load(path, mmap_mode="r")` 打开。
+4. 从 NHWC 单样本图像转为 CHW。
+5. 显式复制为 writable `uint8` contiguous array。
+6. 返回 `torch.uint8` 图像 tensor 和 `float32` label。
+
+脚本显式复制 writable uint8，是为了避免 read-only memmap 传给 `torch.from_numpy` 后在某些 PyTorch/Numpy 组合中引发 worker 崩溃。
+
+### 10.2 `make_loader`
+
+`make_loader()` 统一创建 DataLoader：
+
+- train loader 默认 `shuffle=True`；
+- validation/test 默认 `shuffle=False`；
+- `num_workers`、`prefetch_factor`、`pin_memory`、`persistent_workers` 来自 CLI；
+- 只有 `num_workers > 0` 时才设置 `prefetch_factor` 和 `persistent_workers`。
+
+### 10.3 `prepare_batch`
+
+`prepare_batch()` 负责把 batch 移动到训练设备：
+
+```python
+x = x.to(device, non_blocking=True)
+y = y.to(device, non_blocking=True)
+x = x.float().div_(255.0)
+```
+
+如果启用 `--channels-last` 且设备是 CUDA，会将图像 tensor 转为 channels_last memory format。
+
+## 11. 模型结构
+
+### 11.1 `JiangCNNBlock`
+
+Jiang block 结构：
+
+```text
+Conv2d -> BatchNorm2d -> LeakyReLU -> MaxPool2d
+```
+
+核心参数：
+
+| 参数 | 值 |
+|---|---|
+| kernel | `(5, 3)` |
+| activation | `LeakyReLU(negative_slope=0.01)` |
+| pooling | `MaxPool2d(kernel_size=(2,1), stride=(2,1), ceil_mode=True)` |
+
+### 11.2 `ResLiteCNNBlock`
+
+`ResLiteCNNBlock` 是可选轻量残差变体，通过 `--arch reslite` 启用。它保留 Jiang block 的 pooling schedule，但在 pooling 前使用两层卷积和 residual connection。
+
+如果输入通道或 stride 与输出不匹配，skip path 使用 `1x1 Conv2d + BatchNorm2d`；否则使用 `Identity`。
+
+### 11.3 `JiangCNN2D`
+
+`JiangCNN2D` 根据 `window` 自动选择 block 数、第一层 vertical stride 和 dilation：
+
+| window | blocks | 第一层 vertical stride | 第一层 vertical dilation | channels |
+|---:|---:|---:|---:|---|
+| 5 | 2 | 1 | 1 | 64, 128 |
+| 20 | 3 | 3 | 2 | 64, 128, 256 |
+| 60 | 4 | 3 | 3 | 64, 128, 256, 512 |
+
+初始化参数：
+
+```python
+JiangCNN2D(
+    window,
+    image_height,
+    image_width,
+    in_channels=1,
+    fc_dropout=0.20,
+    spatial_dropout=0.0,
+    arch="jiang",
+)
+```
+
+`fc_dropout` 和 `spatial_dropout` 由 CLI 控制。`feature_dim` 通过 dummy tensor 自动推导：
+
+```python
+dummy = torch.zeros(1, in_channels, image_height, image_width)
+feature_dim = self.spatial_dropout(self.features(dummy)).flatten(1).shape[1]
+```
+
+分类头：
+
+```text
+Flatten -> Dropout(fc_dropout) -> Linear(feature_dim, 1)
+```
+
+模型输出单个 logit，训练使用 `BCEWithLogitsLoss`；评估和预测时用 `sigmoid(logit)` 得到 `pred_prob`。
+
+权重初始化：
+
+- `Conv2d` 和 `Linear` 使用 Xavier uniform；
+- bias 初始化为 0。
+
+## 12. 训练和 checkpoint
+
+### 12.1 `build_optimizer`
+
+默认优化器：
+
+```text
+AdamW(lr=1e-4, weight_decay=3e-5)
+```
+
+也可以通过 `--optimizer adam` 使用 Adam。
+
+### 12.2 `build_scheduler`
+
+支持三种 scheduler：
+
+| 参数 | 行为 |
+|---|---|
+| `--scheduler none` | 不使用 scheduler |
+| `--scheduler cosine` | `CosineAnnealingLR` |
+| `--scheduler plateau` | `ReduceLROnPlateau` |
+
+warmup 由 `set_warmup_lr()` 实现，默认 `--warmup-epochs 1`。
+
+### 12.3 AMP 和 TF32
+
+默认：
+
+- CUDA 可用时，训练和评估在 `torch.amp.autocast(device_type="cuda")` 下执行；
+- 使用 `torch.amp.GradScaler("cuda")`；
+- 允许 matmul 和 cuDNN TF32；
+- `torch.set_float32_matmul_precision("high")` 在可用时生效。
+
+可用 `--no-amp` 和 `--no-tf32` 关闭。
+
+### 12.4 validation 评估
+
+`evaluate_model()` 返回：
+
+- `loss`
+- `auc`
+- `acc`
+- `brier`
+- `probs`
+- `labels`
+- `seconds`
+- `samples_per_sec`
+
+`signal_metrics()` 基于验证集预测概率计算：
+
+- 每日 IC 均值；
+- 每日 RankIC 均值；
+- RankIC 为正的日期占比；
+- decile 平均收益单调性 Spearman；
+- decile 单调性违反次数。
+
+`probability_summary()` 记录预测概率分布，例如均值、标准差、分位数、最小值和最大值。
+
+### 12.5 checkpoint 选择
+
+`checkpoint_score()` 的优先级：
+
+1. 如果 validation RankIC 可用，使用 `valid_rankic_mean`；
+2. 否则如果 validation AUC 可用，使用 `valid_auc`；
+3. 否则使用 `-valid_loss`。
+
+当 `score > best_score + min_delta` 时保存当前模型参数到 CPU。只有在达到 `--min-epochs` 后，连续 `--patience` 个 epoch 没有改善才会 early stop。
+
+## 13. Ensemble 逻辑
+
+### 13.1 多 run 训练
+
+`fit_one_experiment()` 根据 `--ensemble-runs` 决定每个实验训练几次。第 `run_id` 次训练使用：
+
+```text
+seed = RANDOM_SEED + run_id - 1
+```
+
+每次 run 会保存：
+
+- 对应模型权重；
+- `outputs/predictions/ensemble_runs/{stem}/runXX.parquet`；
+- 对应训练日志。
+
+### 13.2 单独训练某个 run
+
+`--ensemble-run-id K` 只训练第 `K` 个 run。该模式不会写最终平均预测文件，适合 GPU array job。
+
+所有 run 完成后，使用 `--ensemble-aggregate-only` 汇总。
+
+### 13.3 概率平均
+
+`aggregate_ensemble_predictions()` 会：
+
+1. 读取或接收所有 run 的预测 DataFrame；
+2. 检查每个 run 的预测行数和关键列顺序一致；
+3. 将各 run 的 `pred_prob_run_XX` 合并到同一张表；
+4. 计算：
+
+```text
+pred_prob = mean(pred_prob_run_01, pred_prob_run_02, ...)
+```
+
+5. 写出最终 `pred_{stem}_jiang_cnn2d.parquet`。
+
+## 14. 与论文设定的对应关系
+
+| 论文设定 | 当前脚本实现 |
+|---|---|
+| 使用价格图像预测未来收益方向 | `label` 为 0/1，模型输出 `pred_prob` |
+| 5/20/60 日图像尺寸 | 上游生成 `[N,32,15,1]`、`[N,64,60,1]`、`[N,96,180,1]` |
+| 不同窗口使用不同 CNN 深度 | `JiangCNN2D.WINDOW_CONFIG` |
+| CNN building block | `JiangCNNBlock` |
+| Conv + BN + LeakyReLU + Pool | `JiangCNNBlock.block` |
+| LeakyReLU slope = 0.01 | `nn.LeakyReLU(negative_slope=0.01)` |
+| Xavier 初始化 | `JiangCNN2D._init_weights()` |
+| 同一模型配置独立训练 5 次并平均概率 | `--ensemble-runs 5` |
+| softmax up/down 二分类 | 当前用单 logit + `BCEWithLogitsLoss`，`sigmoid` 后得到 up 概率 |
+
+当前默认是工程优化配置，不是完全复刻旧 baseline 参数：
+
+| 项目 | 当前默认 |
+|---|---|
+| optimizer | AdamW |
+| lr | `1e-4` |
+| weight decay | `3e-5` |
+| FC dropout | `0.20` |
+| scheduler | cosine |
+| AMP | 开启 |
+| TF32 | 开启 |
+| checkpoint metric | validation RankIC 优先 |
+
+如需更接近旧 baseline 风格，可显式指定：
+
+```powershell
+uv run python 05_train_cnn2d.py --optimizer adam --lr 1e-5 --fc-dropout 0.50 --scheduler none
+```
+
+## 15. 常见问题
+
+### 15.1 找不到图像 shard
+
+报错通常来自 `load_image_window()`：
+
+```text
+No image shards found for window=...
+```
+
+常见原因：
 
 - 未运行 `03_make_images.py`；
-- 实验配置改过，但旧图像没有重新生成；
-- 文件名与 `image_dir_for_window(cfg["window"])` 不一致。
+- 图像仍是旧的按 experiment 目录存储；
+- `config.image_dir_for_window(window)` 指向的目录不存在。
 
-处理：
+处理方式：
 
-- 先重新运行 `03_make_images.py`。
-
-## 13.2 报错：某个 split 为空
-
-报错来自：
-
-```python
-if len(train_idx) == 0 or len(valid_idx) == 0 or len(test_idx) == 0:
+```powershell
+uv run python 03_make_images.py
 ```
 
-可能原因：
+### 15.2 metadata 行数和图像数不一致
 
-- 日期切分区间不合理；
-- 数据覆盖时间太短；
-- I60 图像过滤后样本过少；
-- 训练/验证/测试边界与数据日期不匹配。
+`load_image_window()` 会检查每个 shard 的 `len(meta)` 是否等于 `images.shape[0]`。如果不一致，说明 shard 生成不完整或文件混用，需要重新生成图像。
 
-处理：
+### 15.3 split 为空
 
-- 检查 `config.py` 中的 `TRAIN_END/VALID_START/VALID_END/TEST_START`；
-- 检查对应 `shard_*/meta.parquet` 的日期范围。
+如果 train/valid/test 任一 split 没有样本，`fit_one_experiment_run()` 会报错。常见原因：
 
-## 13.3 AUC 显示为 `nan`
+- 上游数据日期范围不足；
+- `TRAIN_END/VALID_START/VALID_END/TEST_START` 设置不合理；
+- horizon 对应的 purge/embargo 后样本被过滤；
+- 某个 window 的图像尚未生成完整。
 
-原因：
+### 15.4 AUC 显示为 `nan`
 
-- 当前验证集或测试集 label 只有一个类别；
-- `roc_auc_score` 无法在单类别标签上定义。
+如果某个评估 split 的 label 只有一个类别，`roc_auc_score` 无法定义，脚本会返回 `nan`。这不是程序崩溃，而是指标本身不可计算。
 
-脚本处理：
-
-```python
-if len(np.unique(labels)) < 2:
-    auc = np.nan
-```
-
-这不是程序崩溃，而是指标本身无法计算。
-
-## 13.4 GPU 没有被使用
+### 15.5 GPU 没有被使用
 
 `get_device()` 只检查：
 
@@ -1877,155 +752,87 @@ if len(np.unique(labels)) < 2:
 torch.cuda.is_available()
 ```
 
-如果返回 false，会自动使用 CPU。
+如果返回 false，脚本会自动使用 CPU。常见原因是当前 uv 环境安装了 CPU 版 PyTorch，或 CUDA driver / PyTorch CUDA 版本不匹配。
 
-可能原因：
+### 15.6 I60 训练慢或 DataLoader 慢
 
-- 安装的是 CPU 版 PyTorch；
-- CUDA driver 或 PyTorch CUDA 版本不匹配；
-- 当前环境不可见 GPU。
+I60 图像更大、模型更深，训练和 IO 都更重。可优先调整：
 
-## 13.5 I60 训练慢
+- `--batch-size`
+- `--workers`
+- `--prefetch-factor`
+- `--shard-cache-size`
+- `--channels-last`
+- `--profile-batches`
 
-原因：
+如果 `num_workers > 0` 带来不稳定，可尝试：
 
-- I60 图像更大：`96 x 180`；
-- 模型更深：4 个 CNN blocks；
-- 通道数最高到 512；
-- 样本读取和卷积计算都更重。
-
-可调参数：
-
-- `batch_size`
-- `n_epochs`
-- `lr`
-- `num_workers`
-
-注意：Windows 下 `num_workers > 0` 可能引入多进程兼容问题，当前脚本保守设置为 0。
-
-## 14. 修改建议
-
-### 14.1 想只训练某一个实验
-
-可以临时修改 `main()`：
-
-```python
-def main():
-    exp_name = "I20R5"
-    cfg = EXPERIMENTS[exp_name]
-    train_one_experiment(exp_name, cfg)
+```powershell
+uv run python 05_train_cnn2d.py --workers 0 --no-persistent-workers
 ```
 
-### 14.2 想调整 batch size
+### 15.7 只想汇总已训练的 ensemble
 
-改 `train_one_experiment` 默认参数：
-
-```python
-def train_one_experiment(..., batch_size=128, ...):
-```
-
-如果 4090 显存充足，可以尝试：
-
-```python
-batch_size=256
-batch_size=512
-```
-
-但 batch size 变大可能影响优化表现，不只是速度问题。
-
-### 14.3 想调整训练轮数
-
-改：
-
-```python
-n_epochs=50
-```
-
-实际训练通常会被 early stopping 截断。
-
-### 14.4 想改 early stopping
-
-改：
-
-```python
-patience = 2
-```
-
-如果验证 loss 波动较大，可以尝试 3 或 5。
-
-### 14.5 想保存 optimizer 状态
-
-当前只保存：
-
-```python
-torch.save(model.state_dict(), model_path)
-```
-
-如果需要断点恢复，可改成保存 checkpoint：
-
-```python
-torch.save(
-    {
-        "model_state_dict": model.state_dict(),
-        "optimizer_state_dict": optimizer.state_dict(),
-        "best_valid_loss": best_valid_loss,
-    },
-    model_path,
-)
-```
-
-但这会改变加载逻辑，需要同步修改后续推理代码。
-
-## 15. 运行前检查清单
-
-运行 `05_train_cnn2d.py` 前，建议确认：
-
-- `config.py` 中 `EXPERIMENTS` 正确；
-- `03_make_images.py` 已按当前配置重新生成图像；
-- `data/images/i5r5/shard_00000/images.npy` 存在；
-- `data/images/i5r5/shard_00000/meta.parquet` 存在；
-- 其他实验对应文件也存在；
-- `.npy` 的样本数与 metadata 行数一致；
-- `meta["date"]` 覆盖 train/valid/test 三个区间；
-- 当前 Python 环境能 import `torch`；
-- 当前 Python 环境能 import `sklearn`；
-- 当前 Python 环境能读写 parquet。
-
-## 16. 文件输出和后续回测
-
-`05_train_cnn2d.py` 只输出测试集预测。训练集和验证集预测不会保存。
-
-输出 parquet 会被 `06_backtest_decile.py` 读取。回测脚本按每个交易日的 `pred_prob` 做横截面排序：
+确认所有 run 文件存在，例如：
 
 ```text
-pred_prob 越高 -> 模型越看好未来收益为正
+outputs/predictions/ensemble_runs/i20r5/run01.parquet
+outputs/predictions/ensemble_runs/i20r5/run02.parquet
+...
 ```
 
-因此 `pred_prob` 是从 CNN 到组合回测之间最核心的接口字段。
+然后运行：
 
-## 17. 当前实现的边界
+```powershell
+uv run python 05_train_cnn2d.py --experiments I20R5 --ensemble-runs 5 --ensemble-aggregate-only
+```
 
-1. 未做行业中性化。
-2. 未做市值中性化。
-3. 未在训练中显式使用样本权重。
-4. 未保存 validation/test 的逐 epoch 详细日志文件。
-5. 未保存 optimizer checkpoint。
-6. 未做多 GPU DDP。
-7. 未做混合精度训练。
-8. 未做 seed 固定。
+## 16. 运行前检查清单
 
-这些不是 bug，而是当前版本为了保持流程清晰和复现论文主结构所做的简化。
+运行前建议确认：
+
+- `03_make_images.py` 已按当前配置生成 `data/images/window_{window}/shard_*`；
+- 每个 shard 同时有 `images.npy` 和 `meta.parquet`；
+- `.npy` 样本数与 metadata 行数一致；
+- metadata 覆盖 train/valid/test 日期区间；
+- metadata 中存在对应 horizon 的 `label_{h}d` 和 `future_ret_{h}d`；
+- 当前 uv 环境能 import `torch`、`sklearn` 和 parquet engine；
+- CUDA 训练时 `torch.cuda.is_available()` 为 true。
+
+检查当前 Python 解释器：
+
+```powershell
+uv run python -c "import sys; print(sys.executable)"
+```
+
+检查 PyTorch CUDA：
+
+```powershell
+uv run python -c "import torch; print(torch.cuda.is_available()); print(torch.cuda.get_device_name(0) if torch.cuda.is_available() else 'CPU')"
+```
+
+## 17. 当前实现边界
+
+当前脚本仍然不做以下事情：
+
+1. 不做行业中性化。
+2. 不做市值中性化。
+3. 不在训练中显式使用样本权重。
+4. 不保存 optimizer checkpoint。
+5. 不做多 GPU DDP。
+6. 不保存训练集或验证集逐样本预测。
+
+这些是当前训练入口的设计边界，不代表预测文件和回测接口缺失。
 
 ## 18. 总结
 
 `05_train_cnn2d.py` 的核心任务是：
 
-1. 对每个 `I/R` 矩阵实验读取图像和标签；
-2. 根据图像窗口自动选择 Jiang-style CNN 深度；
-3. 用训练集拟合模型；
-4. 用验证集 loss 做 early stopping；
-5. 用测试集输出预测概率；
-6. 保存模型权重和测试集预测结果；
-7. 为后续十分组回测提供 `pred_prob`。
-
-该脚本是图像识别信号进入投资组合评价之前的关键模型训练环节。
+1. 按 window 读取图像 shard 和 metadata；
+2. 按 experiment horizon 选择标签和未来收益；
+3. 用 purge/embargo 后的日期切分构造 train/valid/test；
+4. 训练 Jiang-style 或 ResLite CNN；
+5. 用 validation RankIC/AUC/loss 选择 checkpoint；
+6. 在测试集输出 `pred_prob`；
+7. 可选执行多 run ensemble 并平均预测概率；
+8. 为 `06_backtest_decile.py` 提供标准预测 parquet。

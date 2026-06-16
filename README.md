@@ -2,7 +2,7 @@
 
 基于 A 股日频 OHLCV 数据生成二值蜡烛图，并使用传统特征与 2D CNN 预测未来股票收益方向。项目流程参考 Jiang, Kelly and Xiu (2023) 的价格图像建模思路，并扩展为矩阵收益研究。
 
-当前版本：`v1.2.5`
+当前版本：`v1.2.7`
 
 ## 项目内容
 
@@ -37,6 +37,7 @@ image_trend/
 ├── 05_train_cnn2d_4090_fast.py
 ├── 05_train_cnn2d.md
 ├── 06_backtest_decile.py
+├── 07_backtest_nonoverlap_portfolio.py
 ├── README.md
 ├── data/                    # 本地生成，不上传
 │   ├── processed/
@@ -70,6 +71,7 @@ N:\quant\A_share\daily_OHLVC\
 | `05_train_cnn2d.py` | 官方 CNN 训练入口，面向 4080/4090 优化，并支持论文式多 run 概率平均 | `data/images/window_{window}/shard_*/images.npy`；`data/images/window_{window}/shard_*/meta.parquet` | `outputs/models/jiang_cnn2d_{experiment}.pt` 或 `outputs/models/jiang_cnn2d_{experiment}_run*.pt`；`outputs/predictions/pred_{experiment}_jiang_cnn2d.parquet`；`outputs/tables/cnn_training_log_{experiment}*.csv`；`outputs/tables/cnn_ensemble_summary_{experiment}.csv` | 支持 lazy shard memmap、AMP/TF32、训练诊断、AdamW、RankIC checkpoint、可选 spatial dropout/reslite；默认 `--ensemble-runs 1`，使用 `--ensemble-runs 5` 时独立训练 5 次并对 `pred_prob` 做算术平均 |
 | `05_train_cnn2d_4090_fast.py` | 兼容入口，转发执行 `05_train_cnn2d.py` | 同 `05_train_cnn2d.py` | 同 `05_train_cnn2d.py` | 保留给旧集群脚本使用，不再维护第二份训练逻辑 |
 | `06_backtest_decile.py` | 评估预测效果、Decile 单调性、D1-D10 long-only 组合和 D10-D1 long-short 组合 | `outputs/predictions/pred_*.parquet`；`data/features/features_by_year/year=*/part-*.parquet` | `outputs/tables/*.csv` | CSV；包含 IC、RankIC、累计 IC、Decile 未来收益、单调性、组合收益、换手、逐日净值和回撤、手续费敏感度、绩效汇总、有效收益覆盖率和收益磨损归因 |
+| `07_backtest_nonoverlap_portfolio.py` | 评估严格非重叠持仓组合，每隔 horizon 个交易日一次性全仓换股，并构建 D10-D1 自筹资多空组合 | `outputs/predictions/pred_*.parquet`；`data/features/features_by_year/year=*/part-*.parquet` | `outputs/tables/nonoverlap_*.csv` | CSV；包含非重叠组合收益、D10 long-only 专用收益、换手、逐日净值和回撤、手续费敏感度、绩效汇总、有效收益覆盖率、收益磨损归因，以及 Logistic/CNN 回测组合持仓重叠度；默认不覆盖 `06_backtest_decile.py` 输出 |
 
 `06_backtest_decile.py` 输出表：
 
@@ -98,6 +100,27 @@ outputs/tables/return_attribution.csv
 
 `06_backtest_decile.py` 当前实现为了降低大样本回测开销，组合持仓内部使用整数化 `code_id`、数组化权重向量、到期卖出队列和 forced-hold 队列管理 active cohorts。该优化只改变执行效率，不改变组合收益、涨跌停/停牌处理、手续费或 warmup 统计口径。
 
+`07_backtest_nonoverlap_portfolio.py` 输出表：
+
+```text
+outputs/tables/nonoverlap_portfolio_returns.csv
+outputs/tables/nonoverlap_portfolio_turnover.csv
+outputs/tables/nonoverlap_portfolio_nav.csv
+outputs/tables/nonoverlap_performance_summary.csv
+outputs/tables/nonoverlap_cost_sensitivity.csv
+outputs/tables/nonoverlap_return_attribution.csv
+outputs/tables/nonoverlap_d10_long_only_returns.csv
+outputs/tables/nonoverlap_d10_long_only_nav.csv
+outputs/tables/nonoverlap_d10_long_only_performance.csv
+outputs/tables/nonoverlap_portfolio_holdings.csv
+outputs/tables/nonoverlap_holding_overlap.csv
+outputs/tables/nonoverlap_holding_overlap_summary.csv
+```
+
+`07_backtest_nonoverlap_portfolio.py` 的组合口径为严格非重叠持仓：对 horizon 为 `H` 的预测，只在每个实验/模型/universe 组的第一天可用信号起，每隔 `H` 个交易日调仓一次。D10 多头腿等权到总权重 `+1`，D1 空头腿等权到总权重 `-1`，D10-D1 为自筹资多空组合，不使用 `1/H` 子组合权重。
+
+`nonoverlap_d10_long_only_*.csv` 是从现有 D10 long-only 结果中过滤出的专用表，收益、净值、手续费和绩效字段与 `nonoverlap_portfolio_*` 原表一致。`nonoverlap_portfolio_holdings.csv` 只记录每次实际建仓后的回测组合腿持仓：`D10/long`、`D10_minus_D1/long` 和 `D10_minus_D1/short`。`nonoverlap_holding_overlap.csv` 按相同 experiment、universe、portfolio、leg 和 rebalance date 配对 Logistic 与 CNN，输出共同持仓数、并集持仓数和 Jaccard 重叠度；summary 表按组合腿汇总重叠度分布。
+
 ## 推荐运行顺序
 
 ```powershell
@@ -107,6 +130,12 @@ uv run python 03_make_images.py
 uv run python 04_train_logistic.py
 uv run python 05_train_cnn2d.py
 uv run python 06_backtest_decile.py
+```
+
+如需验证严格非重叠持仓口径，额外运行：
+
+```powershell
+uv run python 07_backtest_nonoverlap_portfolio.py
 ```
 
 若要复现 Jiang 等论文中“同一模型配置独立训练 5 次、最终概率取算术平均”的 CNN 口径，运行：
@@ -131,6 +160,10 @@ uv run python 05_train_cnn2d.py --ensemble-runs 5
 
 如果从 v1.2.4 升级到 v1.2.5，不需要重新生成图像；`05_train_cnn2d_4090_fast.py` 已改为兼容入口，正式训练入口统一为 `05_train_cnn2d.py`。默认仍训练 1 次；如需论文式 ensemble，需要重新运行 `05_train_cnn2d.py --ensemble-runs 5` 生成新的 CNN 预测。由于 `06_backtest_decile.py` 新增 `portfolio_nav.csv` 并优化了组合回测执行路径，如需生成逐日净值和回撤曲线，需要重新运行 `06_backtest_decile.py`。
 
+如果从 v1.2.5 升级到 v1.2.6，不需要重新生成面板、特征、图像或模型预测。新增的非重叠持仓回测只需要运行 `07_backtest_nonoverlap_portfolio.py`，输出文件使用 `nonoverlap_` 前缀，不覆盖 `06_backtest_decile.py` 的重叠持仓结果。
+
+如果从 v1.2.6 升级到 v1.2.7，不需要重新生成面板、特征、图像或模型预测。只需重新运行 `07_backtest_nonoverlap_portfolio.py`，即可补充 D10 long-only 专用输出和 Logistic/CNN 回测组合持仓重叠度输出。
+
 若依赖缺失，请统一安装后再运行。当前项目约定不在脚本中自动安装依赖。
 
 ## 版本记录
@@ -139,6 +172,8 @@ uv run python 05_train_cnn2d.py --ensemble-runs 5
 
 | 日期 | 版本 | 推送内容 | 新增功能 | 待更新功能 |
 | --- | --- | --- | --- | --- |
+| 2026-06-15 | `v1.2.7` | 非重叠回测 D10 long-only 与持仓对比诊断 | `07_backtest_nonoverlap_portfolio.py` 新增 D10 long-only 专用收益、净值和绩效表；新增回测组合构建时的持仓集合输出，并按 `D10/long`、`D10_minus_D1/long`、`D10_minus_D1/short` 计算 Logistic/CNN 持仓 Jaccard 重叠度和汇总表 | 将持仓重叠度接入可视化报告；评估是否将大型明细输出改为 Parquet |
+| 2026-06-13 | `v1.2.6` | 非重叠持仓组合回测 | 新增 `07_backtest_nonoverlap_portfolio.py`，按每个实验/模型/universe 的首个可用信号作为锚点，每隔 horizon 个交易日一次性全仓换股；D10 多头腿等权到 `+1`，D1 空头腿等权到 `-1`，直接构建 D10-D1 自筹资多空组合；输出 `nonoverlap_*.csv`，避免覆盖 `06_backtest_decile.py` 的重叠持仓结果 | 对非重叠结果补充分年度、行业暴露和 beta 暴露报表；评估是否将大型明细输出改为 Parquet |
 | 2026-06-11 | `v1.2.5` | CNN 训练入口合并、论文式 ensemble 支持和回测净值输出 | `05_train_cnn2d.py` 合并 4090 fast 训练逻辑，成为唯一正式 CNN 训练入口；`05_train_cnn2d_4090_fast.py` 改为兼容 wrapper；新增 `--ensemble-runs`，支持每个 experiment 独立训练多次并对测试集概率做算术平均，`--ensemble-runs 5` 对应论文式 5-run 预测信号；`06_backtest_decile.py` 新增 `portfolio_nav.csv`，输出逐日 `gross_nav/net_nav/drawdown`；组合回测 hot path 改为整数化 code id、数组化权重向量、到期卖出队列和 forced-hold 队列，降低 Python dict/list 遍历开销且不改变既有回测逻辑 | 评估 5-run ensemble 的训练耗时和预测收益表现；如默认启用 5-run，需要同步调整 Slurm walltime 和模型存储策略；评估是否将大型明细输出改为 Parquet；补充分年度、行业暴露和 beta 暴露报表 |
 | 2026-06-11 | `v1.2.4` | 回测执行诊断和收益归因升级 | `06_backtest_decile.py` 缺失收益不再导致整日组合收益变成 NaN，改为有效收益股票加权平均；买入受阻股票不进入 cohort，剩余股票在 cohort 内重新等权；卖出受阻股票继续持有，并继续 mark-to-market；新增 `D10_minus_D1` long-short 组合；增加收益归因输出，拆分 `signal_gross_alpha - buy_blocked_loss - sell_blocked_forced_hold_loss - missing_return_data_issue - turnover_cost = attributed_net_return`；多周期组合权重改为独立子组合法，并在绩效统计中剔除前 `horizon` warmup 期 | 进一步数组化 active cohort 和 daily lookup；评估是否将大型明细输出改为 Parquet；补充分年度、行业暴露和 beta 暴露报表 |
 | 2026-06-02 | `v1.2.3` | 4090 CNN 训练诊断和策略升级 | 新增 `05_train_cnn2d_4090_fast.py`；支持 lazy shard memmap、writable uint8 copy、AMP/TF32、AdamW、可配置学习率/weight decay/scheduler/warmup、`fc_dropout`、默认关闭的 `spatial_dropout`、可选 `reslite` 架构、validation RankIC/decile 诊断、batch 级效率日志和 `cnn_training_log_{experiment}.csv`；移除 tqdm 依赖，改用 `--log-interval` 输出集群日志 | 根据训练日志判断是否实现 shard-aware sampler 或合并训练 shard；补充分年度、行业暴露和 beta 暴露报表 |

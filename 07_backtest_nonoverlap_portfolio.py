@@ -967,6 +967,16 @@ def prefixed_name(output_prefix, name):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument(
+        "--pred-dir",
+        default=None,
+        help="Prediction directory. Defaults to config OUTPUT_DIR/predictions.",
+    )
+    parser.add_argument(
+        "--table-dir",
+        default=None,
+        help="Output table directory. Defaults to config OUTPUT_DIR/tables.",
+    )
+    parser.add_argument(
         "--pred-pattern",
         default="pred_*.parquet",
         help="Prediction parquet glob under outputs/predictions.",
@@ -986,7 +996,18 @@ def parse_args():
 
 
 def main():
+    global PRED_DIR, TABLE_DIR
     args = parse_args()
+    if args.pred_dir:
+        PRED_DIR = Path(args.pred_dir).expanduser()
+    if args.table_dir:
+        TABLE_DIR = Path(args.table_dir).expanduser()
+    PRED_DIR.mkdir(parents=True, exist_ok=True)
+    TABLE_DIR.mkdir(parents=True, exist_ok=True)
+    # The 06 module owns prediction loading and table persistence; keep its
+    # module-level directories synchronized with this wrapper's CLI overrides.
+    bt.PRED_DIR = PRED_DIR
+    bt.TABLE_DIR = TABLE_DIR
     pred_files = sorted(glob.glob(str(PRED_DIR / args.pred_pattern)))
     if args.max_files is not None:
         pred_files = pred_files[: args.max_files]

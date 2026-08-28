@@ -57,7 +57,6 @@ from config import (
 PRED_REQUIRED_COLS = {
     "date",
     "code",
-    "pred_prob",
     "future_ret",
     "float_mktcap",
     "horizon",
@@ -138,12 +137,20 @@ def load_prediction_file(path):
     Read and validate one prediction parquet file.
     """
     log(f"Reading predictions: {path}")
-    pred = pd.read_parquet(path, columns=sorted(PRED_REQUIRED_COLS))
+    schema_columns = set(pq.read_schema(path).names)
+    score_column = "pred_score" if "pred_score" in schema_columns else "pred_prob"
+    if score_column not in schema_columns:
+        raise RuntimeError(f"{path} must contain pred_score or pred_prob")
+    read_columns = sorted(PRED_REQUIRED_COLS | {score_column})
+    pred = pd.read_parquet(path, columns=read_columns)
     require_columns(pred, PRED_REQUIRED_COLS, path)
 
     pred = pred.copy()
     pred["date"] = pd.to_datetime(pred["date"])
-    pred["pred_prob"] = pd.to_numeric(pred["pred_prob"], errors="coerce")
+    pred["pred_score"] = pd.to_numeric(pred[score_column], errors="coerce")
+    # Preserve the historical internal column name while allowing v1.3.1
+    # regression/IC signals to use a score rather than a probability.
+    pred["pred_prob"] = pred["pred_score"]
     pred["future_ret"] = pd.to_numeric(pred["future_ret"], errors="coerce")
     pred["float_mktcap"] = pd.to_numeric(pred["float_mktcap"], errors="coerce")
     pred["horizon"] = pd.to_numeric(pred["horizon"], errors="coerce")
@@ -151,7 +158,7 @@ def load_prediction_file(path):
     pred = pred[
         pred["date"].notna()
         & pred["code"].notna()
-        & pred["pred_prob"].notna()
+        & pred["pred_score"].notna()
         & pred["future_ret"].notna()
         & pred["horizon"].notna()
     ].copy()
@@ -1876,11 +1883,27 @@ def parse_args():
         default=None,
         help="Optional cap on the number of prediction files to process.",
     )
+    parser.add_argument(
+        "--pred-dir",
+        default=None,
+        help="Optional prediction directory; defaults to config.PRED_DIR.",
+    )
+    parser.add_argument(
+        "--table-dir",
+        default=None,
+        help="Optional output table directory; defaults to config.TABLE_DIR.",
+    )
     return parser.parse_args()
 
 
 def main():
+    global PRED_DIR, TABLE_DIR
     args = parse_args()
+    if args.pred_dir:
+        PRED_DIR = Path(args.pred_dir).expanduser().resolve()
+    if args.table_dir:
+        TABLE_DIR = Path(args.table_dir).expanduser().resolve()
+    TABLE_DIR.mkdir(parents=True, exist_ok=True)
     pred_files = sorted(glob.glob(str(PRED_DIR / args.pred_pattern)))
     if args.max_files is not None:
         pred_files = pred_files[: args.max_files]

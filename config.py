@@ -8,6 +8,7 @@ train/validation/test split, and experiment definitions.
 You should edit this file first before running other scripts.
 """
 
+import os
 from pathlib import Path
 
 
@@ -16,14 +17,18 @@ from pathlib import Path
 # ============================================================
 
 PROJECT_DIR = Path(__file__).resolve().parent
+PROJECT_VERSION = "1.3.1"
 
-DATA_DIR = PROJECT_DIR / "data"
+# Keep the historical v1.2.x paths as the default, but allow a complete
+# versioned rebuild to live beside them.  The v1.3.1 cluster jobs set these
+# variables explicitly so a failed rebuild cannot damage the old artifacts.
+DATA_DIR = Path(os.environ.get("IMAGE_TREND_DATA_DIR", PROJECT_DIR / "data")).expanduser()
+OUTPUT_DIR = Path(os.environ.get("IMAGE_TREND_OUTPUT_DIR", PROJECT_DIR / "outputs")).expanduser()
 RAW_DIR = DATA_DIR / "raw"
 PROCESSED_DIR = DATA_DIR / "processed"
 FEATURE_DIR = DATA_DIR / "features"
 IMAGE_DIR = DATA_DIR / "images"
 
-OUTPUT_DIR = PROJECT_DIR / "outputs"
 PRED_DIR = OUTPUT_DIR / "predictions"
 TABLE_DIR = OUTPUT_DIR / "tables"
 MODEL_DIR = OUTPUT_DIR / "models"
@@ -90,7 +95,7 @@ def shard_meta_path(exp_name, shard_id):
 # 3. Sample filters
 # ============================================================
 
-START_DATE = "2014-01-01"
+START_DATE = "2009-01-01"
 END_DATE = "2024-12-31"
 
 TRAIN_END = "2019-12-31"

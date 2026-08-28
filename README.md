@@ -2,7 +2,7 @@
 
 基于 A 股日频 OHLCV 数据生成二值蜡烛图，并使用传统特征与 2D CNN 预测未来股票收益方向。项目流程参考 Jiang, Kelly and Xiu (2023) 的价格图像建模思路，并扩展为矩阵收益研究。
 
-当前版本：`v1.2.7`
+当前版本：`v1.3.1`
 
 ## 项目内容
 
@@ -35,9 +35,15 @@ image_trend/
 ├── 04_train_logistic.py
 ├── 05_train_cnn2d.py
 ├── 05_train_cnn2d_4090_fast.py
+├── 05_train_cnn2d_v131.py
+├── aggregate_cnn_v131.py
 ├── 05_train_cnn2d.md
+├── 05_train_cnn2d_v131.md
 ├── 06_backtest_decile.py
 ├── 07_backtest_nonoverlap_portfolio.py
+├── 08_qa_v131.py
+├── slurm/
+│   └── run_v131_background.sh  # 远端幂等、脱离 SSH 的后台提交器
 ├── README.md
 ├── data/                    # 本地生成，不上传
 │   ├── processed/
@@ -70,8 +76,12 @@ N:\quant\A_share\daily_OHLVC\
 | `04_train_logistic.py` | 对每个实验训练传统特征 Logistic 基线 | `data/features/features_by_year/year=*/part-*.parquet` | `outputs/predictions/pred_{experiment}_logistic.parquet` | Parquet；包含测试集 `date`、`code`、`future_ret`、`label`、`experiment_name`、`window`、`horizon`、`model_name`、`pred_prob` |
 | `05_train_cnn2d.py` | 官方 CNN 训练入口，面向 4080/4090 优化，并支持论文式多 run 概率平均 | `data/images/window_{window}/shard_*/images.npy`；`data/images/window_{window}/shard_*/meta.parquet` | `outputs/models/jiang_cnn2d_{experiment}.pt` 或 `outputs/models/jiang_cnn2d_{experiment}_run*.pt`；`outputs/predictions/pred_{experiment}_jiang_cnn2d.parquet`；`outputs/tables/cnn_training_log_{experiment}*.csv`；`outputs/tables/cnn_ensemble_summary_{experiment}.csv` | 支持 lazy shard memmap、AMP/TF32、训练诊断、AdamW、RankIC checkpoint、可选 spatial dropout/reslite；默认 `--ensemble-runs 1`，使用 `--ensemble-runs 5` 时独立训练 5 次并对 `pred_prob` 做算术平均 |
 | `05_train_cnn2d_4090_fast.py` | 兼容入口，转发执行 `05_train_cnn2d.py` | 同 `05_train_cnn2d.py` | 同 `05_train_cnn2d.py` | 保留给旧集群脚本使用，不再维护第二份训练逻辑 |
+| `05_train_cnn2d_v131.py` | v1.3.1 Purged 五折 CNN 消融训练 | `data_v1_3_1/images/window_{window}`；`data_v1_3_1/features/features_by_year` | `outputs/v1_3_1/models`、`outputs/v1_3_1/predictions/members`、训练日志和完成清单 | BCE、Huber、Huber+IC；连续预2021五折、±20交易日 purge、42/43/44/45 四种 seed；日期级逻辑 batch、256 微批、warm-up、ReduceLROnPlateau、25轮上限和 patience=4/min_delta=1e-3 |
+| `aggregate_cnn_v131.py` | 校验20个成员并聚合 v1.3.1 信号 | `outputs/v1_3_1/predictions/members/{loss}/{experiment}` | `outputs/v1_3_1/predictions/pred_*_k5s4.parquet`、ensemble summary | 每个成员原始 logit 逐日 z-score 后算术平均；同时写入 `pred_score`、兼容列 `pred_prob`、平均概率诊断和成员计数 |
 | `06_backtest_decile.py` | 评估预测效果、Decile 单调性、D1-D10 long-only 组合和 D10-D1 long-short 组合 | `outputs/predictions/pred_*.parquet`；`data/features/features_by_year/year=*/part-*.parquet` | `outputs/tables/*.csv` | CSV；包含 IC、RankIC、累计 IC、Decile 未来收益、单调性、组合收益、换手、逐日净值和回撤、手续费敏感度、绩效汇总、有效收益覆盖率和收益磨损归因 |
 | `07_backtest_nonoverlap_portfolio.py` | 评估严格非重叠持仓组合，每隔 horizon 个交易日一次性全仓换股，并构建 D10-D1 自筹资多空组合 | `outputs/predictions/pred_*.parquet`；`data/features/features_by_year/year=*/part-*.parquet` | `outputs/tables/nonoverlap_*.csv` | CSV；包含非重叠组合收益、D10 long-only 专用收益、换手、逐日净值和回撤、手续费敏感度、绩效汇总、有效收益覆盖率、收益磨损归因，以及 Logistic/CNN 回测组合持仓重叠度；默认不覆盖 `06_backtest_decile.py` 输出 |
+| `08_qa_v131.py` | v1.3.1 数据、图像、标签、键和聚合产物 QA | `data_v1_3_1`、可选旧版 `data` | `outputs/v1_3_1/tables/qa/data_qa_v131.json` | 检查 2009–2024 年份、date/code 唯一键、图像与 metadata 行数/形状/二值像素、标签尾部完整性；可抽样比较新旧共同样本 |
+| `slurm/run_v131_background.sh` | 在远端脱离 SSH 安全提交 v1.3.1 依赖链 | 已提交的数据重建和 smoke 作业 ID | `outputs/v1_3_1/logs/background/` 下的 PID、日志、启动/提交清单 | 原子锁和 marker 防重复提交；父进程立即返回，子进程由 `nohup` 脱离终端运行 |
 
 `06_backtest_decile.py` 输出表：
 
@@ -120,6 +130,30 @@ outputs/tables/nonoverlap_holding_overlap_summary.csv
 `07_backtest_nonoverlap_portfolio.py` 的组合口径为严格非重叠持仓：对 horizon 为 `H` 的预测，只在每个实验/模型/universe 组的第一天可用信号起，每隔 `H` 个交易日调仓一次。D10 多头腿等权到总权重 `+1`，D1 空头腿等权到总权重 `-1`，D10-D1 为自筹资多空组合，不使用 `1/H` 子组合权重。
 
 `nonoverlap_d10_long_only_*.csv` 是从现有 D10 long-only 结果中过滤出的专用表，收益、净值、手续费和绩效字段与 `nonoverlap_portfolio_*` 原表一致。`nonoverlap_portfolio_holdings.csv` 只记录每次实际建仓后的回测组合腿持仓：`D10/long`、`D10_minus_D1/long` 和 `D10_minus_D1/short`。`nonoverlap_holding_overlap.csv` 按相同 experiment、universe、portfolio、leg 和 rebalance date 配对 Logistic 与 CNN，输出共同持仓数、并集持仓数和 Jaccard 重叠度；summary 表按组合腿汇总重叠度分布。
+
+## v1.3.1 训练与发布口径
+
+v1.3.1 使用独立的 `data_v1_3_1/` 和 `outputs/v1_3_1/`，不会覆盖 v1.2.x 产物。数据从 2009-01-01 重建到 2024-12-31；不引入 2008 年预热行情，I5/I20/I60 在各自完整回看窗口后自然产生首个图像样本。五折边界由 2009–2020 的统一交易日历按交易日数量切分，验证块前后各剔除 20 个交易日，所有成员统一推断 2021–2024，并仅保留具有完整未来收益的预测行。
+
+每种损失包含 5 folds × 4 seeds（42、43、44、45），五组实验按 `BCE → Huber → Huber+IC` 串行执行。逻辑 batch 是一个完整交易日截面，`shuffle=False`、代码顺序确定，物理微批固定 256；Huber 目标按日期做 1%/99% 去极值和总体标准差 z-score。训练使用 AdamW (`lr=1e-4`, `weight_decay=3e-5`)、Kaiming normal、AMP/TF32、pinned memory、persistent workers、双缓冲 CUDA 预取、2轮线性 warm-up、ReduceLROnPlateau（factor=0.5、patience=1、min_lr=1e-6），最多 25 轮；无最少轮数，验证目标连续 4 轮未超过 `1e-3` 改善即早停。Huber+IC 的目标为 `Huber + 1.0 × (1 - PearsonIC)`，IC 在完整日期截面计算，外部 Pearson 梯度显式保持零和并以 float32 重放；每个逻辑模型在启动或断点续跑时重置对应 seed，CPU 兼容路径的归一化不修改 DataLoader 原始 batch。
+
+远端集群可从项目根目录提交：
+
+```bash
+bash slurm/submit_v131_pipeline.sh
+```
+
+提交脚本按 `afterok` 串联数据重建、三种损失的 20 任务 GPU 数组以及各阶段聚合和两套回测；GPU 任务使用 RTX 4090 并排除 V100，设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。单独 smoke 测试使用 `sbatch slurm/sub_v131_smoke.sh`，输出到 `outputs/v1_3_1_smoke/`，不会污染全量完成清单。
+
+如果数据重建任务已经单独提交，可通过 `V131_DATA_JOB_ID=<jobid> bash slurm/submit_v131_pipeline.sh` 复用该任务作为 `afterok` 起点，避免重复重建面板、特征和图像；首阶段也可同时设置 `V131_SMOKE_JOB_ID=<jobid>`，使训练等待数据和 smoke 均成功。不设置数据变量时，提交脚本会自动新建数据重建任务。
+
+退出 SSH/Codex 前推荐使用自后台化提交器（示例中的 `84642` 和 `84643` 分别是数据与 smoke 作业 ID）：
+
+```bash
+bash slurm/run_v131_background.sh 84642 84643
+```
+
+脚本会立即返回并把子进程重定向到 `outputs/v1_3_1/logs/background/launcher_*.log`；成功提交后写入 `pipeline_submitted.txt`，重复执行会直接显示清单而不会再创建训练作业。若提交中途失败，会保留 `pipeline_started.txt` 以阻止不安全的重复提交，需先检查对应日志和 Slurm 状态。
 
 ## 推荐运行顺序
 
@@ -172,6 +206,7 @@ uv run python 05_train_cnn2d.py --ensemble-runs 5
 
 | 日期 | 版本 | 推送内容 | 新增功能 | 待更新功能 |
 | --- | --- | --- | --- | --- |
+| 2026-08-28 | `v1.3.1` | 2009–2024 数据重建与 Purged 五折 CNN 消融 | 新增独立版本数据/输出目录；BCE、Huber、Huber+IC 三阶段；5 folds × 4 seeds；日期级 batch、±20 交易日 purge、warm-up、Kaiming、Pinned/CUDA 预取、成员校验聚合与两套回测；新增数据 QA 和 Slurm 编排 | 保留远端 checkpoint、成员预测和图像；后续可接入现成策略平台做外部执行回测 |
 | 2026-06-15 | `v1.2.7` | 非重叠回测 D10 long-only 与持仓对比诊断 | `07_backtest_nonoverlap_portfolio.py` 新增 D10 long-only 专用收益、净值和绩效表；新增回测组合构建时的持仓集合输出，并按 `D10/long`、`D10_minus_D1/long`、`D10_minus_D1/short` 计算 Logistic/CNN 持仓 Jaccard 重叠度和汇总表 | 将持仓重叠度接入可视化报告；评估是否将大型明细输出改为 Parquet |
 | 2026-06-13 | `v1.2.6` | 非重叠持仓组合回测 | 新增 `07_backtest_nonoverlap_portfolio.py`，按每个实验/模型/universe 的首个可用信号作为锚点，每隔 horizon 个交易日一次性全仓换股；D10 多头腿等权到 `+1`，D1 空头腿等权到 `-1`，直接构建 D10-D1 自筹资多空组合；输出 `nonoverlap_*.csv`，避免覆盖 `06_backtest_decile.py` 的重叠持仓结果 | 对非重叠结果补充分年度、行业暴露和 beta 暴露报表；评估是否将大型明细输出改为 Parquet |
 | 2026-06-11 | `v1.2.5` | CNN 训练入口合并、论文式 ensemble 支持和回测净值输出 | `05_train_cnn2d.py` 合并 4090 fast 训练逻辑，成为唯一正式 CNN 训练入口；`05_train_cnn2d_4090_fast.py` 改为兼容 wrapper；新增 `--ensemble-runs`，支持每个 experiment 独立训练多次并对测试集概率做算术平均，`--ensemble-runs 5` 对应论文式 5-run 预测信号；`06_backtest_decile.py` 新增 `portfolio_nav.csv`，输出逐日 `gross_nav/net_nav/drawdown`；组合回测 hot path 改为整数化 code id、数组化权重向量、到期卖出队列和 forced-hold 队列，降低 Python dict/list 遍历开销且不改变既有回测逻辑 | 评估 5-run ensemble 的训练耗时和预测收益表现；如默认启用 5-run，需要同步调整 Slurm walltime 和模型存储策略；评估是否将大型明细输出改为 Parquet；补充分年度、行业暴露和 beta 暴露报表 |

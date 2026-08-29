@@ -3,6 +3,7 @@
 import importlib.util
 from pathlib import Path
 import sys
+import tempfile
 import unittest
 
 import numpy as np
@@ -59,6 +60,50 @@ class V131TrainingTests(unittest.TestCase):
         global_indices = np.array([3, 1, 2], dtype=np.int64)
         sampler = MODULE.DateBatchSampler(meta, global_indices)
         self.assertEqual(list(sampler), [[2, 1], [0]])
+        self.assertEqual(sampler.max_batch_size, 2)
+
+    def test_vectorized_date_loader_preserves_requested_order(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            shard0 = np.stack(
+                [np.full((2, 3, 1), 10, dtype=np.uint8), np.full((2, 3, 1), 11, dtype=np.uint8)]
+            )
+            shard1 = np.stack(
+                [np.full((2, 3, 1), 20, dtype=np.uint8), np.full((2, 3, 1), 21, dtype=np.uint8)]
+            )
+            path0 = root / "shard0.npy"
+            path1 = root / "shard1.npy"
+            np.save(path0, shard0)
+            np.save(path1, shard1)
+            dataset = MODULE.V131ImageDataset(
+                [path0, path1],
+                np.array([0.0, 1.0, 0.0, 1.0], dtype=np.float32),
+                np.array([-1.0, 1.0, 0.5, -0.5], dtype=np.float32),
+                np.array([1, 0, 1, 0], dtype=np.int32),
+                np.array([0, 1, 1, 0], dtype=np.int32),
+                np.array([3, 0, 2], dtype=np.int64),
+                shard_cache_size=4,
+            )
+            batch = dataset.__getitems__([0, 1, 2])
+            collated = MODULE.collate_date_batch(batch)
+            self.assertEqual(tuple(collated[0].shape), (3, 1, 2, 3))
+            self.assertEqual(collated[0][:, 0, 0, 0].tolist(), [10, 20, 21])
+            self.assertEqual(collated[3].tolist(), [3, 0, 2])
+
+    def test_auto_micro_batch_scales_for_4080_and_4090(self):
+        device = torch.device("cpu")
+        size_4080 = MODULE.resolve_micro_batch_size(
+            0, 5000, 60, "huber_ic", device, total_memory_bytes=16 * 1024**3
+        )
+        size_4090 = MODULE.resolve_micro_batch_size(
+            0, 5000, 60, "huber_ic", device, total_memory_bytes=24 * 1024**3
+        )
+        explicit = MODULE.resolve_micro_batch_size(
+            256, 5000, 60, "huber_ic", device, total_memory_bytes=24 * 1024**3
+        )
+        self.assertEqual(size_4080, 896)
+        self.assertEqual(size_4090, 1216)
+        self.assertEqual(explicit, 256)
 
     def test_winsorized_target_uses_population_std(self):
         meta = pd.DataFrame(

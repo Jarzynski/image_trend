@@ -26,7 +26,7 @@ python -u 08_qa_v131.py --data-root data_v1_3_1 --output-root outputs/v1_3_1
 - 验证块前 20 个和后 20 个交易日从训练集中剔除；
 - 测试集固定为 2021-01-01 至 2024 年最后一个具有完整未来收益标签的日期。
 
-`DateBatchSampler` 先按 `date` 再按零填充后的 `code` 稳定排序，每次 yield 一个完整日期截面。DataLoader 的 worker 只负责从 uint8 memmap shard 读取；GPU 端以固定 256 的物理微批处理，不改变日期级损失权重。
+`DateBatchSampler` 先按 `date` 再按零填充后的 `code` 稳定排序，每次 yield 一个完整日期截面。DataLoader worker 将该日期的索引按 shard 分组，每个 shard 只做一次向量化 uint8 memmap 读取，再按确定顺序组成完整截面。GPU 端默认依据 GPU 总显存和实验窗口自动选择物理微批；可用 `--micro-batch-size` 显式覆盖，或用 `--max-micro-batch-size` 设置上限，不改变日期级损失权重。
 
 ## 三种损失和目标
 
@@ -49,8 +49,9 @@ Huber + ic_weight * (1 - PearsonIC)
 | early stopping | patience `4`，min_delta `1e-3`，从第 1 轮开始 |
 | scheduler | ReduceLROnPlateau(mode=min, factor=0.5, patience=1, min_lr=1e-6) |
 | seeds | `42, 43, 44, 45` |
-| workers / prefetch | `2` / `2`，persistent workers |
-| micro batch | `256` |
+| workers / prefetch | `8` / `2`，persistent workers |
+| shard mmap cache | 每个 worker 最多 `4096` 个 shard；作业 `ulimit -n 65536` |
+| micro batch | 默认 `0` 表示自动选择：I5/I20 使用完整单日截面，I60 在 RTX 4080/4090 上分别使用 896/1216；最大 `8192`，可显式覆盖 |
 | memory | `pin_memory=True`，双缓冲 CUDA stream，`copy_(..., non_blocking=True)` |
 | numerical | AMP、TF32、FC dropout `0.20` |
 
@@ -74,7 +75,7 @@ outputs/v1_3_1/predictions/members/{loss}/{experiment}/fold##_seed##.parquet
 bash slurm/submit_v131_pipeline.sh
 ```
 
-该脚本提交数据阶段后，严格用 `afterok` 串联 `bce → huber → huber_ic`；每阶段完成聚合、`06_backtest_decile.py` 和 `07_backtest_nonoverlap_portfolio.py`。GPU 数组限制为最多并发 8 个 RTX 4090 任务并排除 V100。smoke 测试使用：
+该脚本提交数据阶段后，严格用 `afterok` 串联 `bce → huber → huber_ic`；每阶段完成聚合、`06_backtest_decile.py` 和 `07_backtest_nonoverlap_portfolio.py`。GPU 数组使用通用 `gpu:1`，可在 RTX 4080 和 RTX 4090 上运行，最多并发 16 个任务并排除 V100。每个任务申请 10 个 CPU，并设置 8 workers、4096 shard cache 和 65536 文件描述符软限制。smoke 测试使用：
 
 若数据阶段已单独提交并成功完成，可设置 `V131_DATA_JOB_ID=<jobid>`；若 smoke 也已提交，可再设置 `V131_SMOKE_JOB_ID=<jobid>`，首个训练阶段会等待两个作业均以 `afterok` 成功结束，避免重复构建或跳过 smoke。
 
@@ -91,3 +92,13 @@ sbatch slurm/sub_v131_smoke.sh
 ```
 
 smoke 输出在 `outputs/v1_3_1_smoke/`，不会写入全量 v1.3.1 完成清单。
+
+输入管线性能与最大窗口显存测试使用：
+
+```bash
+sbatch slurm/sub_v131_perf_smoke.sh
+```
+
+该作业分别测试 I5 BCE 与 I60 Huber+IC，并写入 `outputs/v1_3_1_perf_smoke/`。可设置 `V131_PERF_MODE=i60_contiguous` 单独比较 I60 的连续内存格式；两种模式都不会产生正式成员清单。
+
+I60 压力测试也可通过 `V131_PERF_MODE=i60_batch_probe` 与 `V131_PROBE_BATCH` 指定批量。RTX 4080 上 batch=896 的实测峰值为 14.63 GiB，训练等待占比约 4.1%；RTX 4090 自动档 1216 按相同激活比例瞄准约 20 GiB，同时保留约 4 GiB 的驱动、cuDNN workspace 和波动余量。IC 方差检查与训练标量保持在设备端聚合，每日期只做一次必要的主机同步，Huber+IC 两遍前向之间不执行全设备同步。

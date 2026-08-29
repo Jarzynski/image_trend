@@ -3,9 +3,9 @@
 #SBATCH -p gpu
 #SBATCH -N 1
 #SBATCH -n 1
-#SBATCH -c 4
+#SBATCH -c 10
 #SBATCH --mem=96G
-#SBATCH --gres=gpu:rtx_4090:1
+#SBATCH --gres=gpu:1
 #SBATCH --exclude=compute-g-0
 #SBATCH -o v131_smoke-%j.log
 
@@ -14,16 +14,22 @@ set -euo pipefail
 module load miniconda3/2024.6
 module add cuda/12.8
 source activate image_trend
+ulimit -n 65536
 
 PROJECT_DIR="${IMAGE_TREND_PROJECT_DIR:-${SLURM_SUBMIT_DIR:-$(pwd)}}"
 cd "${PROJECT_DIR}"
 export IMAGE_TREND_DATA_DIR="${PROJECT_DIR}/data_v1_3_1"
 export IMAGE_TREND_OUTPUT_DIR="${PROJECT_DIR}/outputs/v1_3_1_smoke"
 export PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True"
+export CUDA_MODULE_LOADING="LAZY"
 export PYTHONUNBUFFERED=1
+export OMP_NUM_THREADS=1
+export MKL_NUM_THREADS=1
+export OPENBLAS_NUM_THREADS=1
+export NUMEXPR_NUM_THREADS=1
 mkdir -p "${IMAGE_TREND_OUTPUT_DIR}/logs"
 
-COMMON=(--fold-id 1 --seed 42 --purge-days 20 --micro-batch-size 256 --epochs 1 --warmup-epochs 1 --patience 1 --min-delta 1e-3 --workers 2 --prefetch-factor 2 --shard-cache-size 8 --log-interval 1 --smoke-dates 8)
+COMMON=(--fold-id 1 --seed 42 --purge-days 20 --micro-batch-size 0 --max-micro-batch-size 8192 --epochs 1 --warmup-epochs 1 --patience 1 --min-delta 1e-3 --workers 8 --prefetch-factor 2 --shard-cache-size 4096 --channels-last --log-interval 1 --smoke-dates 8)
 for LOSS in bce huber huber_ic; do
     echo "[$(date --iso-8601=seconds)] I5R5 ${LOSS} smoke"
     python -u 05_train_cnn2d_v131.py --loss "${LOSS}" --experiments I5R5 "${COMMON[@]}"

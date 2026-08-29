@@ -35,6 +35,7 @@ import torch
 from torch import Tensor, nn
 from torch.nn import functional as F
 from torch.utils.data import DataLoader, Dataset, Sampler
+from torch.utils.data._utils.collate import default_collate
 
 import config as CONFIG
 from config import (
@@ -51,7 +52,11 @@ from config import (
 LOSS_CHOICES = ("bce", "huber", "huber_ic")
 DEFAULT_SEEDS = (42, 43, 44, 45)
 DEFAULT_PURGE_DAYS = 20
-DEFAULT_MICRO_BATCH_SIZE = 256
+DEFAULT_MICRO_BATCH_SIZE = 0
+DEFAULT_BATCH_WORKERS = 8
+DEFAULT_PREFETCH_FACTOR = 2
+DEFAULT_SHARD_CACHE_SIZE = 4096
+DEFAULT_MAX_MICRO_BATCH_SIZE = 8192
 DEFAULT_EPOCHS = 25
 DEFAULT_WARMUP_EPOCHS = 2
 DEFAULT_PATIENCE = 4
@@ -124,9 +129,10 @@ class TrainOptions:
     min_delta: float = DEFAULT_MIN_DELTA
     ic_weight: float = DEFAULT_IC_WEIGHT
     huber_beta: float = DEFAULT_HUBER_BETA
-    batch_workers: int = 2
-    prefetch_factor: int = 2
-    shard_cache_size: int = 32
+    batch_workers: int = DEFAULT_BATCH_WORKERS
+    prefetch_factor: int = DEFAULT_PREFETCH_FACTOR
+    shard_cache_size: int = DEFAULT_SHARD_CACHE_SIZE
+    max_micro_batch_size: int = DEFAULT_MAX_MICRO_BATCH_SIZE
     lr: float = 1e-4
     weight_decay: float = 3e-5
     fc_dropout: float = 0.20
@@ -149,6 +155,8 @@ def configure_torch(seed: int, tf32: bool = True) -> None:
         torch.cuda.manual_seed_all(int(seed))
         torch.backends.cuda.matmul.allow_tf32 = bool(tf32)
         torch.backends.cudnn.allow_tf32 = bool(tf32)
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cudnn.deterministic = False
     try:
         torch.set_float32_matmul_precision("high")
     except Exception:
@@ -215,6 +223,52 @@ class V131ImageDataset(Dataset):
             torch.tensor(real_idx, dtype=torch.int64),
         )
 
+    def __getitems__(self, positions: Sequence[int]):
+        """Load a complete date batch with one vectorized read per shard.
+
+        PyTorch's map-style DataLoader calls ``__getitems__`` once for the
+        full list emitted by ``DateBatchSampler``.  Grouping the requested
+        rows by shard avoids thousands of scalar tensor allocations and opens
+        each mmap at most once per worker instead of once per stock row.
+        Output positions are restored before returning, so the deterministic
+        date/code ordering is unchanged.
+        """
+        positions_array = np.asarray(positions, dtype=np.int64)
+        if positions_array.size == 0:
+            raise RuntimeError("Encountered an empty date batch")
+        real_indices = self.indices[positions_array]
+        batch_shards = self.shard_ids[real_indices]
+        batch_local = self.local_indices[real_indices]
+
+        first = self._get_shard(int(batch_shards[0]))
+        if first.ndim != 4:
+            raise ValueError(f"Expected NHWC image shard, got shape={first.shape}")
+        height, width, channels = map(int, first.shape[1:])
+        images = np.empty(
+            (len(real_indices), channels, height, width), dtype=np.uint8
+        )
+
+        order = np.argsort(batch_shards, kind="stable")
+        sorted_shards = batch_shards[order]
+        boundaries = np.flatnonzero(np.diff(sorted_shards)) + 1
+        for group in np.split(order, boundaries):
+            shard_id = int(batch_shards[group[0]])
+            shard = self._get_shard(shard_id)
+            block = np.asarray(shard[batch_local[group]], dtype=np.uint8)
+            images[group] = np.transpose(block, (0, 3, 1, 2))
+
+        labels = np.ascontiguousarray(self.labels[real_indices], dtype=np.float32)
+        targets = np.ascontiguousarray(
+            self.regression_targets[real_indices], dtype=np.float32
+        )
+        rows = np.ascontiguousarray(real_indices, dtype=np.int64)
+        return (
+            torch.from_numpy(images),
+            torch.from_numpy(labels),
+            torch.from_numpy(targets),
+            torch.from_numpy(rows),
+        )
+
 
 class DateBatchSampler(Sampler[List[int]]):
     """Yield one chronologically ordered list of global rows per trading day."""
@@ -246,6 +300,10 @@ class DateBatchSampler(Sampler[List[int]]):
 
     def __len__(self) -> int:
         return len(self.batches)
+
+    @property
+    def max_batch_size(self) -> int:
+        return max((len(batch) for batch in self.batches), default=0)
 
 
 class DeviceMicrobatchPool:
@@ -383,11 +441,65 @@ def make_loader(
         "batch_sampler": sampler,
         "num_workers": max(0, int(options.batch_workers)),
         "pin_memory": bool(options.pin_memory and torch.cuda.is_available()),
+        "collate_fn": collate_date_batch,
     }
     if int(options.batch_workers) > 0:
         kwargs["persistent_workers"] = bool(options.persistent_workers)
         kwargs["prefetch_factor"] = int(options.prefetch_factor)
     return DataLoader(dataset, **kwargs)
+
+
+def collate_date_batch(batch: Any) -> Tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Accept the vectorized ``__getitems__`` payload or legacy row samples."""
+    if (
+        isinstance(batch, tuple)
+        and len(batch) == 4
+        and all(isinstance(value, Tensor) for value in batch)
+        and batch[0].ndim == 4
+    ):
+        return batch
+    return default_collate(batch)
+
+
+def resolve_micro_batch_size(
+    requested: int,
+    max_date_rows: int,
+    window: int,
+    loss: str,
+    device: torch.device,
+    max_micro_batch_size: int = DEFAULT_MAX_MICRO_BATCH_SIZE,
+    total_memory_bytes: Optional[int] = None,
+) -> int:
+    """Choose a high-throughput micro-batch for 16/24 GiB Ada GPUs.
+
+    A value greater than zero keeps the explicit user choice.  Zero enables
+    the auto policy.  I5 and I20 fit a complete daily cross-section on both
+    supported cards.  I60 uses empirically measured tiers: 896 rows peaked at
+    14.63 GiB on an RTX 4080; 1,216 rows targets roughly 20 GiB on a 24 GiB
+    RTX 4090.  The result never exceeds the largest full-date cross-section.
+    """
+    max_rows = max(1, int(max_date_rows))
+    upper = min(max_rows, max(1, int(max_micro_batch_size)))
+    if int(requested) > 0:
+        return min(int(requested), upper)
+
+    if total_memory_bytes is None:
+        if device.type == "cuda":
+            total_memory_bytes = int(
+                torch.cuda.get_device_properties(device).total_memory
+            )
+        else:
+            total_memory_bytes = 16 * 1024**3
+    window = int(window)
+    total_gib = float(total_memory_bytes) / float(1024**3)
+    if window <= 20:
+        # The date boundary, rather than memory, is the useful upper limit for
+        # I5/I20.  Going beyond it would silently combine trading dates and
+        # change the requested optimization semantics.
+        resolved = upper
+    else:
+        resolved = 1216 if total_gib >= 20.0 else 896
+    return min(resolved, upper)
 
 
 def load_master_calendar() -> pd.DatetimeIndex:
@@ -497,14 +609,21 @@ def pearson_ic_and_gradient(scores: Tensor, target: Tensor) -> Tuple[Tensor, Ten
     centered_target = target - target.mean()
     var_scores = torch.sum(centered_scores * centered_scores)
     var_target = torch.sum(centered_target * centered_target)
-    if float(var_scores.detach().item()) <= IC_EPS or float(var_target.detach().item()) <= IC_EPS:
-        return scores.new_zeros(()), torch.zeros_like(scores)
-    denominator = torch.sqrt(var_scores * var_target)
-    corr = torch.sum(centered_scores * centered_target) / denominator
+    # Keep the degeneracy check on-device.  Calling ``.item()`` here forces a
+    # CUDA synchronization twice for every date (and twice again during the
+    # Huber+IC replay), leaving visible zero-util gaps between otherwise
+    # saturated kernels.
+    valid = (var_scores > IC_EPS) & (var_target > IC_EPS)
+    safe_var_scores = var_scores.clamp_min(IC_EPS)
+    safe_var_target = var_target.clamp_min(IC_EPS)
+    denominator = torch.sqrt(safe_var_scores * safe_var_target)
+    corr_raw = torch.sum(centered_scores * centered_target) / denominator
+    corr = torch.where(valid, corr_raw, torch.zeros_like(corr_raw))
     grad_corr = (
-        centered_target / torch.sqrt(var_scores * var_target)
-        - corr.detach() * centered_scores / var_scores
+        centered_target / denominator
+        - corr.detach() * centered_scores / safe_var_scores
     )
+    grad_corr = torch.where(valid, grad_corr, torch.zeros_like(grad_corr))
     # Pearson correlation is invariant to a constant shift in every score,
     # therefore its score gradient must sum to zero.  Enforce that invariant
     # after the float32 arithmetic to avoid a spurious intercept gradient from
@@ -609,8 +728,9 @@ def hybrid_date_backward(
     total_grad = huber_grad - float(options.ic_weight) * grad_ic
     total_value = huber_value + float(options.ic_weight) * (1.0 - ic_value)
 
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
+    # All first-pass kernels and the following buffer restores use the current
+    # stream, so stream ordering is sufficient.  A device-wide synchronize at
+    # every date boundary only stalls the input/copy stream.
     restore_batchnorm_buffers(model, bn_state)
     restore_rng_state(device, rng_state)
 
@@ -683,30 +803,45 @@ def train_one_epoch(
             scaler.step(optimizer)
             scaler.update()
         else:
-            date_objective = 0.0
-            date_component = {"bce": 0.0, "huber": 0.0, "ic": 0.0}
+            date_objective_gpu = torch.zeros((), dtype=torch.float32, device=device)
+            date_component_gpu = {
+                "bce": torch.zeros((), dtype=torch.float32, device=device),
+                "huber": torch.zeros((), dtype=torch.float32, device=device),
+                "ic": torch.zeros((), dtype=torch.float32, device=device),
+            }
             offset = 0
             for x, labels, target, size in pool.iterate(x_cpu, labels_cpu, target_cpu):
                 with torch.amp.autocast(
                     device_type="cuda", enabled=device.type == "cuda" and options.amp
                 ):
                     logits = model(x)
-                    value, _ = objective_from_scores(logits, labels, target, options)
+                    if options.loss == "bce":
+                        value = F.binary_cross_entropy_with_logits(logits, labels)
+                    else:
+                        value, _ = huber_value_and_gradient(
+                            logits, target, options.huber_beta
+                        )
                 weight = float(size) / float(n)
                 scaler.scale(value * weight).backward()
-                date_objective += float(value.detach().item()) * weight
+                date_objective_gpu.add_(value.detach().float(), alpha=weight)
                 if options.loss == "bce":
-                    date_component["bce"] += float(value.detach().item()) * weight
+                    date_component_gpu["bce"].add_(value.detach().float(), alpha=weight)
                 else:
                     huber_value, _ = huber_value_and_gradient(logits.detach(), target, options.huber_beta)
                     ic_value, _ = pearson_ic_and_gradient(logits.detach(), target)
-                    date_component["huber"] += float(huber_value.item()) * weight
-                    date_component["ic"] += float(ic_value.item()) * weight
+                    date_component_gpu["huber"].add_(huber_value, alpha=weight)
+                    date_component_gpu["ic"].add_(ic_value, alpha=weight)
                 offset += size
             if offset != n:
                 raise RuntimeError(f"Physical microbatch row mismatch: {offset} != {n}")
             scaler.step(optimizer)
             scaler.update()
+            # One host synchronization per date is sufficient for all logging
+            # scalars; the old implementation synchronized every micro-batch.
+            date_objective = float(date_objective_gpu.item())
+            date_component = {
+                key: float(value.item()) for key, value in date_component_gpu.items()
+            }
             metrics = {
                 "objective": date_objective,
                 **date_component,
@@ -912,9 +1047,12 @@ def train_one_experiment(
     train_ds = V131ImageDataset(image_paths, labels, reg_target, shard_ids, local_indices, train_idx, options.shard_cache_size)
     valid_ds = V131ImageDataset(image_paths, labels, reg_target, shard_ids, local_indices, valid_idx, options.shard_cache_size)
     test_ds = V131ImageDataset(image_paths, labels, reg_target, shard_ids, local_indices, test_idx, options.shard_cache_size)
-    train_loader = make_loader(train_ds, DateBatchSampler(meta, train_idx), options)
-    valid_loader = make_loader(valid_ds, DateBatchSampler(meta, valid_idx), options)
-    test_loader = make_loader(test_ds, DateBatchSampler(meta, test_idx), options)
+    train_sampler = DateBatchSampler(meta, train_idx)
+    valid_sampler = DateBatchSampler(meta, valid_idx)
+    test_sampler = DateBatchSampler(meta, test_idx)
+    train_loader = make_loader(train_ds, train_sampler, options)
+    valid_loader = make_loader(valid_ds, valid_sampler, options)
+    test_loader = make_loader(test_ds, test_sampler, options)
 
     model = LEGACY.JiangCNN2D(
         window=int(cfg["window"]),
@@ -933,7 +1071,15 @@ def train_one_experiment(
     )
     use_amp = bool(options.amp and device.type == "cuda")
     scaler = torch.amp.GradScaler("cuda", enabled=use_amp)
-    pool = DeviceMicrobatchPool(device, options.micro_batch_size, options.channels_last)
+    resolved_micro_batch = resolve_micro_batch_size(
+        options.micro_batch_size,
+        train_sampler.max_batch_size,
+        int(cfg["window"]),
+        options.loss,
+        device,
+        options.max_micro_batch_size,
+    )
+    pool = DeviceMicrobatchPool(device, resolved_micro_batch, options.channels_last)
 
     best_objective = math.inf
     best_state: Optional[Dict[str, Tensor]] = None
@@ -944,7 +1090,9 @@ def train_one_experiment(
     print(
         f"Start {options.loss}/{exp_name} fold={options.fold_id}/seed={options.seed} "
         f"train/valid/test={len(train_idx):,}/{len(valid_idx):,}/{len(test_idx):,} "
-        f"device={device} logical_batch=date micro_batch={options.micro_batch_size}",
+        f"device={device} logical_batch=date micro_batch={resolved_micro_batch} "
+        f"requested_micro_batch={options.micro_batch_size} workers={options.batch_workers} "
+        f"shard_cache={options.shard_cache_size}",
         flush=True,
     )
 
@@ -983,10 +1131,13 @@ def train_one_experiment(
             "train_rows": train_metrics["n_rows"],
             "train_seconds": train_metrics["seconds"],
             "train_wait_seconds": train_metrics["wait_seconds"],
+            "train_wait_fraction": train_metrics["wait_seconds"] / max(train_metrics["seconds"], 1e-9),
             "train_cuda_peak_bytes": train_metrics["cuda_peak_bytes"],
             "valid_seconds": valid_metrics["seconds"],
             "valid_wait_seconds": valid_metrics["wait_seconds"],
+            "valid_wait_fraction": valid_metrics["wait_seconds"] / max(valid_metrics["seconds"], 1e-9),
             "valid_cuda_peak_bytes": valid_metrics["cuda_peak_bytes"],
+            "resolved_micro_batch_size": resolved_micro_batch,
             "best_valid_objective": best_objective,
             "best_epoch": best_epoch,
             "bad_epochs": bad_epochs,
@@ -998,7 +1149,9 @@ def train_one_experiment(
         print(
             f"Epoch {epoch:02d} | train={train_metrics['objective']:.6f} "
             f"valid={valid_objective:.6f} | lr={optimizer.param_groups[0]['lr']:.3g} "
-            f"bad={bad_epochs}/{options.patience}",
+            f"bad={bad_epochs}/{options.patience} | "
+            f"wait={100.0 * train_metrics['wait_seconds'] / max(train_metrics['seconds'], 1e-9):.1f}% "
+            f"peak={train_metrics['cuda_peak_bytes'] / 1024**3:.2f}GiB",
             flush=True,
         )
         if bad_epochs >= int(options.patience):
@@ -1068,6 +1221,7 @@ def train_one_experiment(
         "test_rows": len(prediction_indices),
         "test_wait_seconds": test_metrics["wait_seconds"],
         "test_cuda_peak_bytes": test_metrics["cuda_peak_bytes"],
+        "resolved_micro_batch_size": resolved_micro_batch,
         "train_rows": len(train_idx),
         "valid_rows": len(valid_idx),
         "started_at": started,
@@ -1096,16 +1250,24 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, required=True)
     parser.add_argument("--experiments", default=None)
     parser.add_argument("--purge-days", type=int, default=DEFAULT_PURGE_DAYS)
-    parser.add_argument("--micro-batch-size", type=int, default=DEFAULT_MICRO_BATCH_SIZE)
+    parser.add_argument(
+        "--micro-batch-size",
+        type=int,
+        default=DEFAULT_MICRO_BATCH_SIZE,
+        help="Physical micro-batch; 0 selects an automatic 4080/4090-safe size",
+    )
+    parser.add_argument(
+        "--max-micro-batch-size", type=int, default=DEFAULT_MAX_MICRO_BATCH_SIZE
+    )
     parser.add_argument("--epochs", type=int, default=DEFAULT_EPOCHS)
     parser.add_argument("--warmup-epochs", type=int, default=DEFAULT_WARMUP_EPOCHS)
     parser.add_argument("--patience", type=int, default=DEFAULT_PATIENCE)
     parser.add_argument("--min-delta", type=float, default=DEFAULT_MIN_DELTA)
     parser.add_argument("--ic-weight", type=float, default=DEFAULT_IC_WEIGHT)
     parser.add_argument("--huber-beta", type=float, default=DEFAULT_HUBER_BETA)
-    parser.add_argument("--workers", type=int, default=2)
-    parser.add_argument("--prefetch-factor", type=int, default=2)
-    parser.add_argument("--shard-cache-size", type=int, default=32)
+    parser.add_argument("--workers", type=int, default=DEFAULT_BATCH_WORKERS)
+    parser.add_argument("--prefetch-factor", type=int, default=DEFAULT_PREFETCH_FACTOR)
+    parser.add_argument("--shard-cache-size", type=int, default=DEFAULT_SHARD_CACHE_SIZE)
     parser.add_argument("--lr", type=float, default=1e-4)
     parser.add_argument("--weight-decay", type=float, default=3e-5)
     parser.add_argument("--fc-dropout", type=float, default=0.20)
@@ -1125,12 +1287,15 @@ def main() -> None:
     apply_version_roots(args.data_dir, args.output_dir)
     if args.epochs <= 0 or args.patience <= 0 or args.min_delta < 0:
         raise ValueError("epochs and patience must be positive; min_delta must be non-negative")
+    if args.micro_batch_size < 0 or args.max_micro_batch_size <= 0:
+        raise ValueError("micro batch size must be >= 0 and max micro batch size must be positive")
     options = TrainOptions(
         loss=args.loss,
         fold_id=int(args.fold_id),
         seed=int(args.seed),
         purge_days=int(args.purge_days),
         micro_batch_size=int(args.micro_batch_size),
+        max_micro_batch_size=int(args.max_micro_batch_size),
         epochs=int(args.epochs),
         warmup_epochs=int(args.warmup_epochs),
         patience=int(args.patience),

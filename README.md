@@ -76,12 +76,14 @@ N:\quant\A_share\daily_OHLVC\
 | `04_train_logistic.py` | 对每个实验训练传统特征 Logistic 基线 | `data/features/features_by_year/year=*/part-*.parquet` | `outputs/predictions/pred_{experiment}_logistic.parquet` | Parquet；包含测试集 `date`、`code`、`future_ret`、`label`、`experiment_name`、`window`、`horizon`、`model_name`、`pred_prob` |
 | `05_train_cnn2d.py` | 官方 CNN 训练入口，面向 4080/4090 优化，并支持论文式多 run 概率平均 | `data/images/window_{window}/shard_*/images.npy`；`data/images/window_{window}/shard_*/meta.parquet` | `outputs/models/jiang_cnn2d_{experiment}.pt` 或 `outputs/models/jiang_cnn2d_{experiment}_run*.pt`；`outputs/predictions/pred_{experiment}_jiang_cnn2d.parquet`；`outputs/tables/cnn_training_log_{experiment}*.csv`；`outputs/tables/cnn_ensemble_summary_{experiment}.csv` | 支持 lazy shard memmap、AMP/TF32、训练诊断、AdamW、RankIC checkpoint、可选 spatial dropout/reslite；默认 `--ensemble-runs 1`，使用 `--ensemble-runs 5` 时独立训练 5 次并对 `pred_prob` 做算术平均 |
 | `05_train_cnn2d_4090_fast.py` | 兼容入口，转发执行 `05_train_cnn2d.py` | 同 `05_train_cnn2d.py` | 同 `05_train_cnn2d.py` | 保留给旧集群脚本使用，不再维护第二份训练逻辑 |
-| `05_train_cnn2d_v131.py` | v1.3.1 Purged 五折 CNN 消融训练 | `data_v1_3_1/images/window_{window}`；`data_v1_3_1/features/features_by_year` | `outputs/v1_3_1/models`、`outputs/v1_3_1/predictions/members`、训练日志和完成清单 | BCE、Huber、Huber+IC；连续预2021五折、±20交易日 purge、42/43/44/45 四种 seed；日期级逻辑 batch、256 微批、warm-up、ReduceLROnPlateau、25轮上限和 patience=4/min_delta=1e-3 |
+| `05_train_cnn2d_v131.py` | v1.3.1 Purged 五折 CNN 消融训练 | `data_v1_3_1/images/window_{window}`；`data_v1_3_1/features/features_by_year` | `outputs/v1_3_1/models`、`outputs/v1_3_1/predictions/members`、训练日志和完成清单 | BCE、Huber、Huber+IC；连续预2021五折、±20交易日 purge、42/43/44/45 四种 seed；日期级逻辑 batch、按显存自动选择微批、向量化 shard 读取、warm-up、ReduceLROnPlateau、25轮上限和 patience=4/min_delta=1e-3 |
 | `aggregate_cnn_v131.py` | 校验20个成员并聚合 v1.3.1 信号 | `outputs/v1_3_1/predictions/members/{loss}/{experiment}` | `outputs/v1_3_1/predictions/pred_*_k5s4.parquet`、ensemble summary | 每个成员原始 logit 逐日 z-score 后算术平均；同时写入 `pred_score`、兼容列 `pred_prob`、平均概率诊断和成员计数 |
 | `06_backtest_decile.py` | 评估预测效果、Decile 单调性、D1-D10 long-only 组合和 D10-D1 long-short 组合 | `outputs/predictions/pred_*.parquet`；`data/features/features_by_year/year=*/part-*.parquet` | `outputs/tables/*.csv` | CSV；包含 IC、RankIC、累计 IC、Decile 未来收益、单调性、组合收益、换手、逐日净值和回撤、手续费敏感度、绩效汇总、有效收益覆盖率和收益磨损归因 |
 | `07_backtest_nonoverlap_portfolio.py` | 评估严格非重叠持仓组合，每隔 horizon 个交易日一次性全仓换股，并构建 D10-D1 自筹资多空组合 | `outputs/predictions/pred_*.parquet`；`data/features/features_by_year/year=*/part-*.parquet` | `outputs/tables/nonoverlap_*.csv` | CSV；包含非重叠组合收益、D10 long-only 专用收益、换手、逐日净值和回撤、手续费敏感度、绩效汇总、有效收益覆盖率、收益磨损归因，以及 Logistic/CNN 回测组合持仓重叠度；默认不覆盖 `06_backtest_decile.py` 输出 |
 | `08_qa_v131.py` | v1.3.1 数据、图像、标签、键和聚合产物 QA | `data_v1_3_1`、可选旧版 `data` | `outputs/v1_3_1/tables/qa/data_qa_v131.json` | 检查 2009–2024 年份、date/code 唯一键、图像与 metadata 行数/形状/二值像素、标签尾部完整性；可抽样比较新旧共同样本 |
 | `slurm/run_v131_background.sh` | 在远端脱离 SSH 安全提交 v1.3.1 依赖链 | 已提交的数据重建和 smoke 作业 ID | `outputs/v1_3_1/logs/background/` 下的 PID、日志、启动/提交清单 | 原子锁和 marker 防重复提交；父进程立即返回，子进程由 `nohup` 脱离终端运行 |
+| `slurm/sub_v131_perf_smoke.sh` | 4080/4090 输入管线与显存压力测试 | 已完成的 v1.3.1 图像和特征 | `outputs/v1_3_1_perf_smoke/` 与正式日志目录 | 分别覆盖 I5 BCE 和 I60 Huber+IC，不写入正式成员清单；可用 `V131_PERF_MODE=i60_contiguous` 比较内存格式 |
+| `slurm/migrate_v131_to_optimized.sh` | 从旧 4090-only 队列安全迁移到优化队列 | 旧作业 ID 与两个在途成员 | `outputs/v1_3_1/logs/migration/` | 等待成员的 manifest/model/prediction 全部原子落盘后才取消精确旧作业并提交训练-only依赖链 |
 
 `06_backtest_decile.py` 输出表：
 
@@ -135,7 +137,7 @@ outputs/tables/nonoverlap_holding_overlap_summary.csv
 
 v1.3.1 使用独立的 `data_v1_3_1/` 和 `outputs/v1_3_1/`，不会覆盖 v1.2.x 产物。数据从 2009-01-01 重建到 2024-12-31；不引入 2008 年预热行情，I5/I20/I60 在各自完整回看窗口后自然产生首个图像样本。五折边界由 2009–2020 的统一交易日历按交易日数量切分，验证块前后各剔除 20 个交易日，所有成员统一推断 2021–2024，并仅保留具有完整未来收益的预测行。
 
-每种损失包含 5 folds × 4 seeds（42、43、44、45），五组实验按 `BCE → Huber → Huber+IC` 串行执行。逻辑 batch 是一个完整交易日截面，`shuffle=False`、代码顺序确定，物理微批固定 256；Huber 目标按日期做 1%/99% 去极值和总体标准差 z-score。训练使用 AdamW (`lr=1e-4`, `weight_decay=3e-5`)、Kaiming normal、AMP/TF32、pinned memory、persistent workers、双缓冲 CUDA 预取、2轮线性 warm-up、ReduceLROnPlateau（factor=0.5、patience=1、min_lr=1e-6），最多 25 轮；无最少轮数，验证目标连续 4 轮未超过 `1e-3` 改善即早停。Huber+IC 的目标为 `Huber + 1.0 × (1 - PearsonIC)`，IC 在完整日期截面计算，外部 Pearson 梯度显式保持零和并以 float32 重放；每个逻辑模型在启动或断点续跑时重置对应 seed，CPU 兼容路径的归一化不修改 DataLoader 原始 batch。
+每种损失包含 5 folds × 4 seeds（42、43、44、45），五组实验按 `BCE → Huber → Huber+IC` 串行执行。逻辑 batch 是一个完整交易日截面，`shuffle=False`、代码顺序确定；物理微批默认按 GPU 总显存和实验窗口自动选择，也可显式覆盖并用 `--max-micro-batch-size` 限制。I5/I20 使用完整单日截面；I60 在 RTX 4080/4090 上分别自动使用 896/1216，实测对应约 14.63 GiB/目标约 20 GiB。DataLoader 对一个日期涉及的每个 shard 只执行一次向量化 memmap 读取，避免逐样本打开和 Python tensor 分配。Huber 目标按日期做 1%/99% 去极值和总体标准差 z-score。训练使用 AdamW (`lr=1e-4`, `weight_decay=3e-5`)、Kaiming normal、AMP/TF32、pinned memory、persistent workers、双缓冲 CUDA 预取、2轮线性 warm-up、ReduceLROnPlateau（factor=0.5、patience=1、min_lr=1e-6），最多 25 轮；无最少轮数，验证目标连续 4 轮未超过 `1e-3` 改善即早停。Huber+IC 的目标为 `Huber + 1.0 × (1 - PearsonIC)`，IC 在完整日期截面计算，外部 Pearson 梯度显式保持零和并以 float32 重放；IC 退化检查留在 GPU，日期内日志标量合并同步，重放之间不执行全设备 barrier。每个逻辑模型在启动或断点续跑时重置对应 seed，CPU 兼容路径的归一化不修改 DataLoader 原始 batch。
 
 远端集群可从项目根目录提交：
 
@@ -143,7 +145,7 @@ v1.3.1 使用独立的 `data_v1_3_1/` 和 `outputs/v1_3_1/`，不会覆盖 v1.2.
 bash slurm/submit_v131_pipeline.sh
 ```
 
-提交脚本按 `afterok` 串联数据重建、三种损失的 20 任务 GPU 数组以及各阶段聚合和两套回测；GPU 任务使用 RTX 4090 并排除 V100，设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。单独 smoke 测试使用 `sbatch slurm/sub_v131_smoke.sh`，输出到 `outputs/v1_3_1_smoke/`，不会污染全量完成清单。
+提交脚本按 `afterok` 串联数据重建、三种损失的 20 任务 GPU 数组以及各阶段聚合和两套回测；GPU 任务使用通用 `gpu:1`，因此可调度 RTX 4080 或 RTX 4090，同时排除 V100 节点。数组默认最多并发 16 个任务，单任务申请 10 个 CPU；作业将文件描述符软限制提高到 65536，使用 8 个 persistent workers、`prefetch_factor=2`、4096 shard mmap cache，并设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。单独 smoke 测试使用 `sbatch slurm/sub_v131_smoke.sh`，输出到 `outputs/v1_3_1_smoke/`，不会污染全量完成清单。
 
 如果数据重建任务已经单独提交，可通过 `V131_DATA_JOB_ID=<jobid> bash slurm/submit_v131_pipeline.sh` 复用该任务作为 `afterok` 起点，避免重复重建面板、特征和图像；首阶段也可同时设置 `V131_SMOKE_JOB_ID=<jobid>`，使训练等待数据和 smoke 均成功。不设置数据变量时，提交脚本会自动新建数据重建任务。
 
@@ -206,6 +208,7 @@ uv run python 05_train_cnn2d.py --ensemble-runs 5
 
 | 日期 | 版本 | 推送内容 | 新增功能 | 待更新功能 |
 | --- | --- | --- | --- | --- |
+| 2026-08-29 | `v1.3.1` | 4080/4090 GPU 输入与同步优化 | 日期级读取改为按 shard 向量化批量加载；I60 微批按卡型设为 896/1216，4090 目标约 20 GiB；消除日期级 device barrier 和微批级 `.item()` 同步；提高 worker、mmap cache、文件描述符上限和数组并发；Slurm 改为同时接受 RTX 4080/4090 并继续排除 V100；增加独立性能 smoke 与安全迁移脚本 | I5 输入优化实测吞吐约提升 1.65 倍、等待占比约从 94% 降至 8%；I60/Huber+IC 在 4080 上 batch=896 峰值 14.63 GiB、等待约 4.1%；继续观察全量训练的共享存储压力 |
 | 2026-08-28 | `v1.3.1` | 2009–2024 数据重建与 Purged 五折 CNN 消融 | 新增独立版本数据/输出目录；BCE、Huber、Huber+IC 三阶段；5 folds × 4 seeds；日期级 batch、±20 交易日 purge、warm-up、Kaiming、Pinned/CUDA 预取、成员校验聚合与两套回测；新增数据 QA 和 Slurm 编排 | 保留远端 checkpoint、成员预测和图像；后续可接入现成策略平台做外部执行回测 |
 | 2026-06-15 | `v1.2.7` | 非重叠回测 D10 long-only 与持仓对比诊断 | `07_backtest_nonoverlap_portfolio.py` 新增 D10 long-only 专用收益、净值和绩效表；新增回测组合构建时的持仓集合输出，并按 `D10/long`、`D10_minus_D1/long`、`D10_minus_D1/short` 计算 Logistic/CNN 持仓 Jaccard 重叠度和汇总表 | 将持仓重叠度接入可视化报告；评估是否将大型明细输出改为 Parquet |
 | 2026-06-13 | `v1.2.6` | 非重叠持仓组合回测 | 新增 `07_backtest_nonoverlap_portfolio.py`，按每个实验/模型/universe 的首个可用信号作为锚点，每隔 horizon 个交易日一次性全仓换股；D10 多头腿等权到 `+1`，D1 空头腿等权到 `-1`，直接构建 D10-D1 自筹资多空组合；输出 `nonoverlap_*.csv`，避免覆盖 `06_backtest_decile.py` 的重叠持仓结果 | 对非重叠结果补充分年度、行业暴露和 beta 暴露报表；评估是否将大型明细输出改为 Parquet |

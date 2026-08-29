@@ -102,3 +102,5 @@ sbatch slurm/sub_v131_perf_smoke.sh
 该作业分别测试 I5 BCE 与 I60 Huber+IC，并写入 `outputs/v1_3_1_perf_smoke/`。可设置 `V131_PERF_MODE=i60_contiguous` 单独比较 I60 的连续内存格式；两种模式都不会产生正式成员清单。
 
 I60 压力测试也可通过 `V131_PERF_MODE=i60_batch_probe` 与 `V131_PROBE_BATCH` 指定批量。RTX 4080 上 batch=896 的实测峰值为 14.63 GiB，训练等待占比约 4.1%；RTX 4090 自动档 1216 按相同激活比例瞄准约 20 GiB，同时保留约 4 GiB 的驱动、cuDNN workspace 和波动余量。IC 方差检查与训练标量保持在设备端聚合，每日期只做一次必要的主机同步，Huber+IC 两遍前向之间不执行全设备同步。
+
+I5 同卡并发使用 `sub_v131_i5_pack_probe.sh` 在期末 64 个最大股票截面上测试。RTX 4080 的 2/3/4/5 路分别在 78/91/107/124 秒完成对应模型数，均未 OOM；5 路的单卡模型吞吐最高，因此正式训练由 `sub_v131_train_i5_packed.sh` 用 4 张 GPU 各运行 5 个成员。每个进程保持独立 seed、模型、optimizer 和日期截面，不进行跨模型梯度共享。若同卡并发期间有成员未生成非空 manifest，数组任务保留已完成产物，并对缺失成员逐个顺序重试。

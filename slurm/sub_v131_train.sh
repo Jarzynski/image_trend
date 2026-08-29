@@ -32,6 +32,7 @@ export OPENBLAS_NUM_THREADS=1
 export NUMEXPR_NUM_THREADS=1
 
 LOSS="${V131_LOSS:?V131_LOSS must be supplied as bce, huber or huber_ic}"
+EXPERIMENTS="${V131_EXPERIMENTS:-}"
 SEEDS=(42 43 44 45)
 TASK_ID="${SLURM_ARRAY_TASK_ID:-0}"
 FOLD_ID="$((TASK_ID / 4 + 1))"
@@ -41,10 +42,15 @@ SEED="${SEEDS[${SEED_INDEX}]}"
 mkdir -p "${OUTPUT_ROOT}/logs/slurm"
 echo "[$(date --iso-8601=seconds)] nofile_soft=$(ulimit -Sn) nofile_hard=$(ulimit -Hn)"
 echo "[$(date --iso-8601=seconds)] loss=${LOSS} fold=${FOLD_ID} seed=${SEED} host=$(hostname)"
+EXPERIMENT_ARGS=()
+if [[ -n "${EXPERIMENTS}" ]]; then
+    EXPERIMENT_ARGS=(--experiments "${EXPERIMENTS}")
+fi
 python -u 05_train_cnn2d_v131.py \
     --loss "${LOSS}" \
     --fold-id "${FOLD_ID}" \
     --seed "${SEED}" \
+    "${EXPERIMENT_ARGS[@]}" \
     --purge-days 20 \
     --micro-batch-size 0 \
     --max-micro-batch-size 8192 \

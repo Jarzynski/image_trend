@@ -83,6 +83,8 @@ N:\quant\A_share\daily_OHLVC\
 | `08_qa_v131.py` | v1.3.1 数据、图像、标签、键和聚合产物 QA | `data_v1_3_1`、可选旧版 `data` | `outputs/v1_3_1/tables/qa/data_qa_v131.json` | 检查 2009–2024 年份、date/code 唯一键、图像与 metadata 行数/形状/二值像素、标签尾部完整性；可抽样比较新旧共同样本 |
 | `slurm/run_v131_background.sh` | 在远端脱离 SSH 安全提交 v1.3.1 依赖链 | 已提交的数据重建和 smoke 作业 ID | `outputs/v1_3_1/logs/background/` 下的 PID、日志、启动/提交清单 | 原子锁和 marker 防重复提交；父进程立即返回，子进程由 `nohup` 脱离终端运行 |
 | `slurm/sub_v131_perf_smoke.sh` | 4080/4090 输入管线与显存压力测试 | 已完成的 v1.3.1 图像和特征 | `outputs/v1_3_1_perf_smoke/` 与正式日志目录 | 分别覆盖 I5 BCE 和 I60 Huber+IC，不写入正式成员清单；可用 `V131_PERF_MODE=i60_contiguous` 比较内存格式 |
+| `slurm/sub_v131_i5_pack_probe.sh` | I5 同卡 2–5 进程基准 | 期末 64 个最大股票截面 | `outputs/v1_3_1_pack_probe/` | 独立比较整卡吞吐、墙钟时间和 OOM；不写入正式成员清单 |
+| `slurm/sub_v131_train_i5_packed.sh` | I5 正式同卡并行训练 | I5R5 的 20 个 fold/seed 成员 | 正式模型、成员预测、manifest 与 packed 日志 | 4 个数组任务，每卡并发 5 个成员；若偶发失败，仅将缺失 manifest 对应成员顺序重试 |
 | `slurm/migrate_v131_to_optimized.sh` | 从旧 4090-only 队列安全迁移到优化队列 | 旧作业 ID 与两个在途成员 | `outputs/v1_3_1/logs/migration/` | 等待成员的 manifest/model/prediction 全部原子落盘后才取消精确旧作业并提交训练-only依赖链 |
 
 `06_backtest_decile.py` 输出表：
@@ -145,7 +147,7 @@ v1.3.1 使用独立的 `data_v1_3_1/` 和 `outputs/v1_3_1/`，不会覆盖 v1.2.
 bash slurm/submit_v131_pipeline.sh
 ```
 
-提交脚本按 `afterok` 串联数据重建、三种损失的 20 任务 GPU 数组以及各阶段聚合和两套回测；GPU 任务使用通用 `gpu:1`，因此可调度 RTX 4080 或 RTX 4090，同时排除 V100 节点。数组默认最多并发 16 个任务，单任务申请 10 个 CPU；作业将文件描述符软限制提高到 65536，使用 8 个 persistent workers、`prefetch_factor=2`、4096 shard mmap cache，并设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。单独 smoke 测试使用 `sbatch slurm/sub_v131_smoke.sh`，输出到 `outputs/v1_3_1_smoke/`，不会污染全量完成清单。
+提交脚本按 `afterok` 串联数据重建、三种损失及各阶段聚合和两套回测；每个 loss 内，I5 使用 4 个 packed 数组任务、每卡并发 5 个成员，I20R5/I60R5/I20R20/I60R20 则拆成四个独立的 20 成员数组并行调度，全部完成后才聚合。GPU 任务使用通用 `gpu:1`，因此可调度 RTX 4080 或 RTX 4090，同时排除 V100 节点。普通数组默认最多并发 16 个任务，单任务申请 10 个 CPU；作业将文件描述符软限制提高到 65536，使用 8 个 persistent workers、`prefetch_factor=2`、4096 shard mmap cache，并设置 `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`。单独 smoke 测试使用 `sbatch slurm/sub_v131_smoke.sh`，输出到 `outputs/v1_3_1_smoke/`，不会污染全量完成清单。
 
 如果数据重建任务已经单独提交，可通过 `V131_DATA_JOB_ID=<jobid> bash slurm/submit_v131_pipeline.sh` 复用该任务作为 `afterok` 起点，避免重复重建面板、特征和图像；首阶段也可同时设置 `V131_SMOKE_JOB_ID=<jobid>`，使训练等待数据和 smoke 均成功。不设置数据变量时，提交脚本会自动新建数据重建任务。
 
@@ -209,6 +211,7 @@ uv run python 05_train_cnn2d.py --ensemble-runs 5
 | 日期 | 版本 | 推送内容 | 新增功能 | 待更新功能 |
 | --- | --- | --- | --- | --- |
 | 2026-08-29 | `v1.3.1` | 4080/4090 GPU 输入与同步优化 | 日期级读取改为按 shard 向量化批量加载；I60 微批按卡型设为 896/1216，4090 目标约 20 GiB；消除日期级 device barrier 和微批级 `.item()` 同步；提高 worker、mmap cache、文件描述符上限和数组并发；Slurm 改为同时接受 RTX 4080/4090 并继续排除 V100；增加独立性能 smoke 与安全迁移脚本 | I5 输入优化实测吞吐约提升 1.65 倍、等待占比约从 94% 降至 8%；I60/Huber+IC 在 4080 上 batch=896 峰值 14.63 GiB、等待约 4.1%；继续观察全量训练的共享存储压力 |
+| 2026-08-29 | `v1.3.1` | I5 同卡并发与实验级数组拆分 | 用最大期末截面测试同卡 2/3/4/5 个 I5 模型；正式选择每卡 5 个以降低饱和集群下的总 GPU 时间，20 个成员仅占 4 张卡；I20/I60 四组实验分别提交独立数组 | 2/3/4/5 路分别用 78/91/107/124 秒完成对应数量的完整 smoke，均无 OOM；5 路正式卡实测 util 100%，并保留缺失成员顺序重试保护 |
 | 2026-08-28 | `v1.3.1` | 2009–2024 数据重建与 Purged 五折 CNN 消融 | 新增独立版本数据/输出目录；BCE、Huber、Huber+IC 三阶段；5 folds × 4 seeds；日期级 batch、±20 交易日 purge、warm-up、Kaiming、Pinned/CUDA 预取、成员校验聚合与两套回测；新增数据 QA 和 Slurm 编排 | 保留远端 checkpoint、成员预测和图像；后续可接入现成策略平台做外部执行回测 |
 | 2026-06-15 | `v1.2.7` | 非重叠回测 D10 long-only 与持仓对比诊断 | `07_backtest_nonoverlap_portfolio.py` 新增 D10 long-only 专用收益、净值和绩效表；新增回测组合构建时的持仓集合输出，并按 `D10/long`、`D10_minus_D1/long`、`D10_minus_D1/short` 计算 Logistic/CNN 持仓 Jaccard 重叠度和汇总表 | 将持仓重叠度接入可视化报告；评估是否将大型明细输出改为 Parquet |
 | 2026-06-13 | `v1.2.6` | 非重叠持仓组合回测 | 新增 `07_backtest_nonoverlap_portfolio.py`，按每个实验/模型/universe 的首个可用信号作为锚点，每隔 horizon 个交易日一次性全仓换股；D10 多头腿等权到 `+1`，D1 空头腿等权到 `-1`，直接构建 D10-D1 自筹资多空组合；输出 `nonoverlap_*.csv`，避免覆盖 `06_backtest_decile.py` 的重叠持仓结果 | 对非重叠结果补充分年度、行业暴露和 beta 暴露报表；评估是否将大型明细输出改为 Parquet |

@@ -105,6 +105,20 @@ class V131TrainingTests(unittest.TestCase):
         self.assertEqual(size_4090, 1216)
         self.assertEqual(explicit, 256)
 
+    def test_smoke_date_filter_can_select_largest_late_cross_sections(self):
+        meta = pd.DataFrame(
+            {
+                "date": pd.to_datetime(
+                    ["2019-01-01", "2019-01-02", "2019-01-03", "2019-01-03"]
+                )
+            }
+        )
+        indices = np.arange(len(meta), dtype=np.int64)
+        head = MODULE.filter_smoke_dates(indices, meta, 1, "head")
+        tail = MODULE.filter_smoke_dates(indices, meta, 1, "tail")
+        self.assertEqual(head.tolist(), [0])
+        self.assertEqual(tail.tolist(), [2, 3])
+
     def test_winsorized_target_uses_population_std(self):
         meta = pd.DataFrame(
             {

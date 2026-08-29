@@ -144,6 +144,7 @@ class TrainOptions:
     channels_last: bool = False
     log_interval: int = 200
     smoke_dates: Optional[int] = None
+    smoke_date_position: str = "head"
 
 
 def configure_torch(seed: int, tf32: bool = True) -> None:
@@ -998,10 +999,21 @@ def output_paths(options: TrainOptions, exp_name: str) -> Dict[str, Path]:
     }
 
 
-def filter_smoke_dates(indices: np.ndarray, meta: pd.DataFrame, limit: Optional[int]) -> np.ndarray:
+def filter_smoke_dates(
+    indices: np.ndarray,
+    meta: pd.DataFrame,
+    limit: Optional[int],
+    position: str = "head",
+) -> np.ndarray:
     if limit is None:
         return indices
-    dates = pd.DatetimeIndex(sorted(pd.to_datetime(meta.iloc[indices]["date"]).unique()))[: int(limit)]
+    dates = pd.DatetimeIndex(
+        sorted(pd.to_datetime(meta.iloc[indices]["date"]).unique())
+    )
+    if position == "tail":
+        dates = dates[-int(limit) :]
+    else:
+        dates = dates[: int(limit)]
     return indices[np.isin(pd.to_datetime(meta.iloc[indices]["date"]).to_numpy(), dates.to_numpy())]
 
 
@@ -1032,9 +1044,15 @@ def train_one_experiment(
     train_idx, valid_idx, test_idx, split_meta = split_indices(
         meta, fold_range, calendar, options.purge_days
     )
-    train_idx = filter_smoke_dates(train_idx, meta, options.smoke_dates)
-    valid_idx = filter_smoke_dates(valid_idx, meta, options.smoke_dates)
-    test_idx = filter_smoke_dates(test_idx, meta, options.smoke_dates)
+    train_idx = filter_smoke_dates(
+        train_idx, meta, options.smoke_dates, options.smoke_date_position
+    )
+    valid_idx = filter_smoke_dates(
+        valid_idx, meta, options.smoke_dates, options.smoke_date_position
+    )
+    test_idx = filter_smoke_dates(
+        test_idx, meta, options.smoke_dates, options.smoke_date_position
+    )
     if min(len(train_idx), len(valid_idx), len(test_idx)) == 0:
         raise RuntimeError(
             f"Empty split for {exp_name}: train={len(train_idx)}, valid={len(valid_idx)}, test={len(test_idx)}"
@@ -1279,6 +1297,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--channels-last", action="store_true")
     parser.add_argument("--log-interval", type=int, default=200)
     parser.add_argument("--smoke-dates", type=int, default=None)
+    parser.add_argument(
+        "--smoke-date-position",
+        choices=("head", "tail"),
+        default="head",
+        help="Select earliest or latest dates when --smoke-dates is enabled.",
+    )
     return parser.parse_args()
 
 
@@ -1316,6 +1340,7 @@ def main() -> None:
         channels_last=bool(args.channels_last),
         log_interval=int(args.log_interval),
         smoke_dates=args.smoke_dates,
+        smoke_date_position=args.smoke_date_position,
     )
     configure_torch(options.seed, options.tf32)
     device = LEGACY.get_device()
